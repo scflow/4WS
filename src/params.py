@@ -11,6 +11,7 @@ class VehicleParams:
     - Iz: 横摆转动惯量
     - a: 质心到前轴距离
     - b: 质心到后轴距离
+    - width: 车身宽度（用于前端绘制矩形）
     - kf: 前轴侧偏刚度（轴级聚合）
     - kr: 后轴侧偏刚度（轴级聚合）
     - U: 纵向速度（常值或缓变，仿真中可更新）
@@ -23,12 +24,16 @@ class VehicleParams:
     Iz: float = 2500.0
     a: float = 1.2
     b: float = 1.6
+    width: float = 1.8
+    track: float = 1.5
     kf: float = 1.6e5
     kr: float = 1.7e5
     U: float = 20.0
     mu: float = 0.85
     g: float = 9.81
     U_min: float = 0.5
+    # 轮胎模型选择：'pacejka'（魔术方程）或 'linear'（线性侧偏刚度）
+    tire_model: str = 'pacejka'
 
     @property
     def L(self) -> float:
@@ -67,12 +72,15 @@ class VehicleParams:
             "Iz": self.Iz,
             "a": self.a,
             "b": self.b,
+            "width": self.width,
+            "track": self.track,
             "kf": self.kf,
             "kr": self.kr,
             "U": self.U,
             "mu": self.mu,
             "g": self.g,
             "U_min": self.U_min,
+            "tire_model": self.tire_model,
             "L": self.L,
             "K": self.understeer_gradient(),
         }
