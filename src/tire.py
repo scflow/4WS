@@ -104,3 +104,23 @@ def combine_friction_ellipse(
         return Fx_pure, Fy_pure
     scale = 1.0 / np.sqrt(radius2)
     return Fx_pure * scale, Fy_pure * scale
+
+
+def lateral_force_dispatch(
+    alpha: float,
+    Fz: float,
+    model: str,
+    linear_k: float | None,
+    p_params: PacejkaParams | None,
+) -> float:
+    """派发横向力计算：线性或 Pacejka。
+
+    - linear：返回 -k * alpha
+    - 其他：使用 Pacejka 公式
+    """
+    m = (model or 'linear').lower().strip()
+    if m == 'linear':
+        k = float(linear_k or 0.0)
+        return float(-k * float(alpha))
+    params = p_params or PacejkaParams()
+    return float(pacejka_lateral(float(alpha), float(Fz), params))

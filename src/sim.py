@@ -1,43 +1,19 @@
 import threading
 import time
-from dataclasses import dataclass
 from typing import List, Dict, Literal
 
 import numpy as np
 
 from .params import VehicleParams
-from .model import derivatives as deriv_2dof
+from .model import SimState, Control, TrackSettings
+from .twodof import derivatives as deriv_2dof
+from .dof_utils import body_to_world_2dof, body_to_world_3dof, curvature_4ws
 from .threedof import (
     Vehicle3DOF,
     State3DOF,
-    slip_angles,
-    tire_forces,
-    combine_friction_ellipse,
+    allocate_drive,
+    derivatives_dfdr,
 )
-
-
-@dataclass
-class SimState:
-    x: float = 0.0
-    y: float = 0.0
-    psi: float = 0.0  # rad
-    beta: float = 0.0
-    r: float = 0.0
-
-
-@dataclass
-class Control:
-    U: float = 10.0           # m/s
-    delta_f: float = 0.0      # rad
-    delta_r: float = 0.0      # rad
-
-
-@dataclass
-class TrackSettings:
-    enabled: bool = True
-    retention_sec: float = 30.0
-    max_points: int = 20000
-
 
 class SimEngine:
     """后端仿真引擎：维护状态、轨迹与控制，并在后台线程中积分。"""
@@ -68,6 +44,9 @@ class SimEngine:
         self.phase_auto = False            # 关闭高速同相覆盖，恢复手动后轮转向
         self.k_v = 0.8                     # 纵向速度跟踪增益（减弱牵引对Fy挤占）
         self.tau_ctrl = 0.15               # 控制输入滤波时间常数（s）
+        # 可配置的横摆阻尼与饱和控制参数（由后端 API 可更新）
+        self.yaw_damp = 220.0              # 横摆阻尼力矩系数
+        self.yaw_sat_gain = 3.0            # 横摆率饱和额外阻尼增益
         self._df_filt = 0.0
         self._dr_filt = 0.0
         self._U_cmd_filt = float(self.ctrl.U)
@@ -83,6 +62,9 @@ class SimEngine:
         # 牵引分配：后轴为主；按转角对齐车体轴衰减前轴扭矩（减小纵向致转力矩并保留侧向容量）
         self.drive_bias_front = 0.1        # 前轴基础牵引比例
         self.drive_bias_rear = 0.9         # 后轴基础牵引比例
+        # 低速融合时间常数（s）：yaw 与侧偏的几何/动力学混合
+        self.tau_low = 0.25
+        self.tau_beta = 0.35
 
     # 线程主循环
     def _loop(self):
@@ -110,11 +92,24 @@ class SimEngine:
             d = deriv_2dof(x_vec, self.ctrl.delta_f, self.ctrl.delta_r, self.params)
             beta_dot, r_dot = float(d["xdot"][0]), float(d["xdot"][1])
 
-            # 姿态与位置积分（2DOF）：psi_dot = r；x_dot = U * cos(psi + beta)，y_dot = U * sin(psi + beta)
-            U = self.params.U_eff()
+            # 姿态与位置积分（2DOF）：psi_dot = r；x_dot/y_dot 使用带符号 U（允许倒车）
+            U_signed = float(self.params.U)
             psi_dot = self.state2.r
-            x_dot = U * np.cos(self.state2.psi + self.state2.beta)
-            y_dot = U * np.sin(self.state2.psi + self.state2.beta)
+            x_dot, y_dot = body_to_world_2dof(U_signed, self.state2.beta, self.state2.psi)
+
+            # 低速融合：根据 |U| 与 U_blend 计算权重（平滑步进 smoothstep）
+            U_mag = self.params.U_eff()
+            U_blend = max(1e-9, float(getattr(self.params, 'U_blend', 0.3)))
+            t = max(0.0, min(1.0, U_mag / U_blend))
+            w = t * t * (3.0 - 2.0 * t)
+            # 几何目标横摆率与几何导数（r 指令跟踪；beta 轻微阻尼）
+            kappa = curvature_4ws(float(self.ctrl.delta_f), float(self.ctrl.delta_r), self.params.L)
+            r_des = U_signed * kappa
+            r_dot_kin = (r_des - self.state2.r) / max(1e-6, self.tau_low)
+            beta_dot_kin = - self.state2.beta / max(1e-6, self.tau_beta)
+            # 混合导数
+            beta_dot = w * beta_dot + (1.0 - w) * beta_dot_kin
+            r_dot = w * r_dot + (1.0 - w) * r_dot_kin
 
             self.state2.beta += beta_dot * dt
             self.state2.r += r_dot * dt
@@ -150,8 +145,17 @@ class SimEngine:
                 tire_model=self.params.tire_model,
             )
             # 为提升曲率、减弱过强抑制，适当降低横摆阻尼与饱和增益
-            vp3.yaw_damp = 220.0
-            vp3.yaw_sat_gain = 3.0
+            vp3.yaw_damp = float(self.yaw_damp)
+            vp3.yaw_sat_gain = float(self.yaw_sat_gain)
+            # 将全局附着系数映射到 3DOF 轮胎参数（保持与 2DOF 一致的体验）
+            try:
+                mu_val = float(self.params.mu)
+                vp3.tire_params_f.mu_y = mu_val
+                vp3.tire_params_r.mu_y = mu_val
+                vp3.tire_long_params_f.mu_x = mu_val
+                vp3.tire_long_params_r.mu_x = mu_val
+            except Exception:
+                pass
 
             # 直接使用控制输入的 df/dr（前端原始角度）
             df_raw = float(self.ctrl.delta_f)
@@ -166,61 +170,42 @@ class SimEngine:
             # 纵向驱动/制动：目标速度跟踪，体现 Fx-Fy 耦合
             ax_cmd = self.k_v * (self._U_cmd_filt - self.state3.vx)
             Fx_total = vp3.m * ax_cmd
-            # 牵引后轴化 + 转角相关衰减：
-            # 根据 cos^2(δ) 对齐车体轴分配，避免前轴在大角时产生 Fx*sin(δ) 的推转力矩并保留侧向容量
-            cosdf2 = float(np.cos(df) ** 2)
-            cosdr2 = float(np.cos(dr) ** 2)
-            front_share = self.drive_bias_front * cosdf2
-            rear_share = self.drive_bias_rear * cosdr2
-            share_sum = front_share + rear_share
-            if share_sum <= 1e-9:
-                Fx_f_pure = 0.0
-                Fx_r_pure = Fx_total
-            else:
-                Fx_f_pure = Fx_total * front_share / share_sum
-                Fx_r_pure = Fx_total * rear_share / share_sum
+            # 牵引分配（模块化函数）：角度相关衰减 + 轴向比例
+            Fx_f_pure, Fx_r_pure = allocate_drive(Fx_total, df, dr, self.drive_bias_front, self.drive_bias_rear)
 
-            # 轮胎侧偏与横向力
-            alpha_f, alpha_r = slip_angles(self.state3.vx, self.state3.vy, self.state3.r, df, dr, vp3)
-            Fy_f, Fy_r = tire_forces(alpha_f, alpha_r, vp3)
-            Fzf, Fzr = vp3.static_loads()
-            Fx_f, Fy_f = combine_friction_ellipse(
-                Fx_f_pure, Fy_f, Fzf, vp3.tire_long_params_f.mu_x, vp3.tire_params_f.mu_y
-            )
-            Fx_r, Fy_r = combine_friction_ellipse(
-                Fx_r_pure, Fy_r, Fzr, vp3.tire_long_params_r.mu_x, vp3.tire_params_r.mu_y
-            )
+            # 3DOF 导数（模块化函数）：包含轮胎侧偏、摩擦椭圆与动力学方程
+            ds, aux = derivatives_dfdr(self.state3, df, dr, vp3, Fx_f_pure, Fx_r_pure)
 
-            # 3DOF 动力学
-            vx_dot = (1.0 / vp3.m) * (
-                Fx_f * np.cos(df) - Fy_f * np.sin(df) + Fx_r * np.cos(dr) - Fy_r * np.sin(dr)
-            ) + self.state3.r * self.state3.vy
-            vy_dot = (1.0 / vp3.m) * (
-                Fx_f * np.sin(df) + Fy_f * np.cos(df) + Fx_r * np.sin(dr) + Fy_r * np.cos(dr)
-            ) - self.state3.r * self.state3.vx
-            Mz = (
-                (Fx_f * np.sin(df) + Fy_f * np.cos(df)) * vp3.a
-                - (Fx_r * np.sin(dr) + Fy_r * np.cos(dr)) * vp3.b
-            )
-            # 横摆阻尼力矩，近似自回正效应，防止 r 无界增长
-            r_dot = (Mz - vp3.yaw_damp * self.state3.r) / vp3.Iz
-            # 横摆率饱和抑制：|r| ≤ mu_y * g / U
-            vx_eff = max(vp3.U_min, self.state3.vx)
-            mu_y = min(vp3.tire_params_f.mu_y, vp3.tire_params_r.mu_y)
-            r_max = mu_y * vp3.g / vx_eff
-            if abs(self.state3.r) > r_max:
-                r_dot -= vp3.yaw_sat_gain * (abs(self.state3.r) - r_max) * np.sign(self.state3.r)
-            psi_dot = self.state3.r
-            x_dot = self.state3.vx * np.cos(self.state3.psi) - self.state3.vy * np.sin(self.state3.psi)
-            y_dot = self.state3.vx * np.sin(self.state3.psi) + self.state3.vy * np.cos(self.state3.psi)
+            # 低速融合（3DOF）：将动力学导数与几何导数按速度平滑混合
+            U_signed = float(self.ctrl.U)
+            speed_mag = float(np.hypot(self.state3.vx, self.state3.vy))
+            U_blend = max(1e-9, float(getattr(self.params, 'U_blend', 0.3)))
+            t = max(0.0, min(1.0, speed_mag / U_blend))
+            w = t * t * (3.0 - 2.0 * t)
+            # 几何：目标横摆率、纵向速度跟踪、侧向速度阻尼与位移沿航向
+            kappa = curvature_4ws(df, dr, vp3.L)
+            r_des = U_signed * kappa
+            r_dot_kin = (r_des - self.state3.r) / max(1e-6, self.tau_low)
+            vx_dot_kin = ax_cmd  # 与上方速度跟踪一致
+            vy_dot_kin = - self.state3.vy / max(1e-6, self.tau_beta)
+            xdot_kin, ydot_kin = body_to_world_2dof(U_signed, 0.0, self.state3.psi)
+            # 动力学导数分量
+            vx_dot_dyn, vy_dot_dyn, r_dot_dyn, x_dot_dyn, y_dot_dyn, psi_dot_dyn = map(float, ds)
+            # 混合
+            vx_dot = w * vx_dot_dyn + (1.0 - w) * vx_dot_kin
+            vy_dot = w * vy_dot_dyn + (1.0 - w) * vy_dot_kin
+            r_dot  = w * r_dot_dyn  + (1.0 - w) * r_dot_kin
+            x_dot  = w * x_dot_dyn  + (1.0 - w) * xdot_kin
+            y_dot  = w * y_dot_dyn  + (1.0 - w) * ydot_kin
+            psi_dot= self.state3.r
 
             # 积分（显式欧拉，保持与 3DOF 脚本一致）
             self.state3.vx += vx_dot * dt
             self.state3.vy += vy_dot * dt
-            self.state3.r += r_dot * dt
-            self.state3.psi += psi_dot * dt
-            self.state3.x += x_dot * dt
-            self.state3.y += y_dot * dt
+            self.state3.r  += r_dot  * dt
+            self.state3.x  += x_dot  * dt
+            self.state3.y  += y_dot  * dt
+            self.state3.psi+= psi_dot * dt
 
             # 3DOF：使用滤波/限幅后的轮角计算角速度；速度与半径
             self._df_dot = (df - self._df_cur) / dt

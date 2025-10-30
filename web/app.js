@@ -5,7 +5,7 @@ let params = {
   m: 1500, Iz: 2500, a: 1.2, b: 1.6,
   width: 1.8, track: 1.5,
   kf: 1.6e5, kr: 1.7e5,
-  U: 20, mu: 0.85, g: 9.81, U_min: 0.5,
+  U: 20, mu: 0.85, g: 9.81, U_min: 0.001, U_blend: 0.3,
   tire_model: 'pacejka',
 };
 let state = { x: 0, y: 0, psi: 0, beta: 0, r: 0 };
@@ -159,6 +159,12 @@ function bindUI() {
     });
   }
 
+  // 轨迹导出为 CSV
+  const exportBtn = document.getElementById('export_track');
+  if (exportBtn) {
+    exportBtn.addEventListener('click', () => { try { exportTrackCSV(); } catch (e) {} });
+  }
+
   // 手动设置：车速与前后轮角
   const speedInput = document.getElementById('speed_input');
   const dfInput = document.getElementById('df_input');
@@ -183,7 +189,7 @@ function bindUI() {
     let patch = null;
     switch(e.key.toLowerCase()) {
       case 'w': patch = { U: (ctrl.U + KEY_INC.speed) }; break;
-      case 's': patch = { U: Math.max(0, ctrl.U - KEY_INC.speed) }; break;
+      case 's': patch = { U: (ctrl.U - KEY_INC.speed) }; break;
       case 'a': patch = { df_deg: (deg(ctrl.df) + KEY_INC.steer) }; break;
       case 'd': patch = { df_deg: (deg(ctrl.df) - KEY_INC.steer) }; break;
       case 'q': patch = { dr_deg: (deg(ctrl.dr) - KEY_INC.steer) }; break;
@@ -201,7 +207,7 @@ function bindUI() {
     a: document.getElementById('p_a'), b: document.getElementById('p_b'),
     width: document.getElementById('p_width'), track: document.getElementById('p_track'),
     kf: document.getElementById('p_kf'), kr: document.getElementById('p_kr'),
-    mu: document.getElementById('p_mu'), g: document.getElementById('p_g'), U_min: document.getElementById('p_Umin'),
+    mu: document.getElementById('p_mu'), g: document.getElementById('p_g'), U_min: document.getElementById('p_Umin'), U_blend: document.getElementById('p_Ublend'),
   };
   for (const key of Object.keys(pInputs)) {
     pInputs[key].addEventListener('change', () => {
@@ -393,13 +399,44 @@ function drawVehicle() {
 }
 function draw() { const rect = canvas.getBoundingClientRect(); ctx.clearRect(0, 0, rect.width, rect.height); drawGrid(); drawTrack(); drawVehicle(); }
 
+// 导出当前保留的轨迹为 CSV 文件
+function exportTrackCSV() {
+  try {
+    if (!Array.isArray(track) || track.length === 0) { alert('当前无可导出的轨迹'); return; }
+    const hasTime = typeof track[0].t === 'number';
+    const t0 = hasTime ? track[0].t : null;
+    const rows = [];
+    rows.push('t,x,y');
+    for (let i = 0; i < track.length; i++) {
+      const p = track[i] || {};
+      const t = (hasTime && typeof p.t === 'number') ? (t0 !== null ? (p.t - t0) : p.t) : '';
+      const x = (typeof p.x === 'number') ? p.x : '';
+      const y = (typeof p.y === 'number') ? p.y : '';
+      rows.push(`${t},${x},${y}`);
+    }
+    const csv = rows.join('\n');
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    const ts = new Date().toISOString().replace(/[:.]/g, '-');
+    a.download = `track_${ts}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 0);
+  } catch (e) {
+    console.warn('导出 CSV 失败', e);
+    alert('导出失败，请稍后重试');
+  }
+}
+
 // 后端交互（节流）
 let postTimer = null;
 function schedulePostParams() {
   if (postTimer) clearTimeout(postTimer);
   postTimer = setTimeout(async () => {
     try {
-      const patch = { m: params.m, Iz: params.Iz, a: params.a, b: params.b, width: params.width, track: params.track, kf: params.kf, kr: params.kr, U: params.U, mu: params.mu, g: params.g, U_min: params.U_min, tire_model: params.tire_model };
+      const patch = { m: params.m, Iz: params.Iz, a: params.a, b: params.b, width: params.width, track: params.track, kf: params.kf, kr: params.kr, U: params.U, mu: params.mu, g: params.g, U_min: params.U_min, U_blend: params.U_blend, tire_model: params.tire_model };
       const res = await fetch('/api/params', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(patch) });
       setConnStatus(res.ok);
     } catch (e) { console.warn('POST /api/params 失败', e); setConnStatus(false); }
@@ -410,14 +447,14 @@ async function loadParams() {
     const res = await fetch('/api/params'); setConnStatus(res.ok);
     const data = await res.json();
     // 覆写参数
-    for (const k of ['m','Iz','a','b','width','track','kf','kr','U','mu','g','U_min','tire_model']) { if (typeof data[k] !== 'undefined') params[k] = data[k]; }
+    for (const k of ['m','Iz','a','b','width','track','kf','kr','U','mu','g','U_min','U_blend','tire_model']) { if (typeof data[k] !== 'undefined') params[k] = data[k]; }
     // 更新输入框
     const setVal = (id, v) => { const el = document.getElementById(id); if (el) el.value = String(v); };
     setVal('speed_input', (ctrl.U ?? params.U).toFixed(2));
     setVal('df_input', deg(ctrl.df ?? 0).toFixed(1));
     setVal('dr_input', deg(ctrl.dr ?? 0).toFixed(1));
     setVal('p_m', params.m); setVal('p_Iz', params.Iz); setVal('p_a', params.a); setVal('p_b', params.b);
-    setVal('p_kf', params.kf); setVal('p_kr', params.kr); setVal('p_width', params.width); setVal('p_track', params.track); setVal('p_mu', params.mu); setVal('p_g', params.g); setVal('p_Umin', params.U_min);
+    setVal('p_kf', params.kf); setVal('p_kr', params.kr); setVal('p_width', params.width); setVal('p_track', params.track); setVal('p_mu', params.mu); setVal('p_g', params.g); setVal('p_Umin', params.U_min); setVal('p_Ublend', params.U_blend);
     setVal('p_tire_model', params.tire_model);
     // 更新派生量显示（也可从后端 data.L / data.K）
     const pL = document.getElementById('p_L'); const pK = document.getElementById('p_K');

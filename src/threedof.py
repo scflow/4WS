@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Tuple
 import numpy as np
+from .dof_utils import static_loads, yaw_rate_limit, apply_yaw_saturation, slip_angles_3dof
 
 from .tire import (
     PacejkaParams,
@@ -8,6 +9,7 @@ from .tire import (
     pacejka_lateral,
     pacejka_longitudinal,
     combine_friction_ellipse,
+    lateral_force_dispatch,
 )
 
 
@@ -61,10 +63,7 @@ class Vehicle3DOF:
 
     def static_loads(self) -> Tuple[float, float]:
         """Front/rear static vertical loads (ignoring load transfer)."""
-        # Static distribution by distances
-        Fzf = self.m * self.g * (self.b / self.L)
-        Fzr = self.m * self.g * (self.a / self.L)
-        return Fzf, Fzr
+        return static_loads(float(self.a), float(self.b), float(self.m), float(self.g))
 
 
 @dataclass
@@ -84,58 +83,55 @@ def control_4ws(delta_sw: float, r: float, vp: Vehicle3DOF) -> Tuple[float, floa
     return df, dr
 
 
-def slip_angles(vx: float, vy: float, r: float, df: float, dr: float, vp: Vehicle3DOF) -> Tuple[float, float]:
-    """Compute front/rear slip angles alpha_f, alpha_r (bicycle model)."""
-    vx_eff = max(vp.U_min, vx)
-    alpha_f = np.arctan2(vy + vp.a * r, vx_eff) - df
-    alpha_r = np.arctan2(vy - vp.b * r, vx_eff) - dr
-    return alpha_f, alpha_r
+    
 
 
 def tire_forces(alpha_f: float, alpha_r: float, vp: Vehicle3DOF) -> Tuple[float, float]:
-    """Compute lateral tire forces Fy front/rear based on selected model."""
+    """Compute lateral tire forces Fy front/rear based on selected model (dispatch)."""
     Fzf, Fzr = vp.static_loads()
-    if (vp.tire_model or '').lower() == 'linear':
-        # Linear bicycle model lateral forces
-        Fy_f = -vp.kf * float(alpha_f)
-        Fy_r = -vp.kr * float(alpha_r)
-    else:
-        # Default: Pacejka magic formula
-        Fy_f = pacejka_lateral(alpha_f, Fzf, vp.tire_params_f)
-        Fy_r = pacejka_lateral(alpha_r, Fzr, vp.tire_params_r)
+    model_sel = (vp.tire_model or 'linear').lower()
+    Fy_f = lateral_force_dispatch(float(alpha_f), Fzf, model_sel, vp.kf, vp.tire_params_f)
+    Fy_r = lateral_force_dispatch(float(alpha_r), Fzr, model_sel, vp.kr, vp.tire_params_r)
     return Fy_f, Fy_r
 
 
-def derivatives(s: State3DOF, delta_sw: float, vp: Vehicle3DOF) -> Tuple[np.ndarray, Dict[str, float]]:
+def allocate_drive(Fx_total: float, df: float, dr: float, front_bias: float, rear_bias: float) -> Tuple[float, float]:
+    """Distribute longitudinal force to front/rear axles with angle-aware attenuation."""
+    cosdf2 = float(np.cos(df) ** 2)
+    cosdr2 = float(np.cos(dr) ** 2)
+    front_share = front_bias * cosdf2
+    rear_share = rear_bias * cosdr2
+    share_sum = front_share + rear_share
+    if share_sum <= 1e-9:
+        return 0.0, Fx_total
+    Fx_f_pure = Fx_total * front_share / share_sum
+    Fx_r_pure = Fx_total * rear_share / share_sum
+    return float(Fx_f_pure), float(Fx_r_pure)
+
+
+def derivatives_dfdr(
+    s: State3DOF,
+    df: float,
+    dr: float,
+    vp: Vehicle3DOF,
+    Fx_f_pure: float = 0.0,
+    Fx_r_pure: float = 0.0,
+) -> Tuple[np.ndarray, Dict[str, float]]:
     """
-    Compute time derivatives for the 3-DOF nonlinear model.
+    Compute derivatives for 3DOF given wheel angles df/dr and external pure longitudinal forces.
 
-    Returns
-    - ds: np.array([vx_dot, vy_dot, r_dot, x_dot, y_dot, psi_dot])
-    - aux: dict of auxiliary values for logging/analysis
+    This mirrors `derivatives(...)` but uses df/dr directly and combines longitudinal forces via friction ellipse.
+    Returns (ds, aux) like the original.
     """
-    df, dr = control_4ws(delta_sw, s.r, vp)
-    alpha_f, alpha_r = slip_angles(s.vx, s.vy, s.r, df, dr, vp)
-    Fy_f, Fy_r = tire_forces(alpha_f, alpha_r, vp)
+    alpha_f, alpha_r = slip_angles_3dof(s.vx, s.vy, s.r, df, dr, vp.a, vp.b, vp.U_min)
+    Fy_f_pure, Fy_r_pure = tire_forces(alpha_f, alpha_r, vp)
+    Fzf, Fzr = vp.static_loads()
 
-    # Longitudinal slip ratios (defaults zero if not provided externally)
-    # Placeholders; actual values should be provided by simulate() via closure
-    lmbd_f = derivatives._lambda_f(s)
-    lmbd_r = derivatives._lambda_r(s)
-
-    # Pure forces
-    Fx_f_pure = pacejka_longitudinal(lmbd_f, vp.static_loads()[0], vp.tire_long_params_f)
-    Fx_r_pure = pacejka_longitudinal(lmbd_r, vp.static_loads()[1], vp.tire_long_params_r)
-
-    Fy_f_pure = Fy_f
-    Fy_r_pure = Fy_r
-
-    # Combine via friction ellipse per axle
     Fx_f, Fy_f = combine_friction_ellipse(
-        Fx_f_pure, Fy_f_pure, vp.static_loads()[0], vp.tire_long_params_f.mu_x, vp.tire_params_f.mu_y
+        Fx_f_pure, Fy_f_pure, Fzf, vp.tire_long_params_f.mu_x, vp.tire_params_f.mu_y
     )
     Fx_r, Fy_r = combine_friction_ellipse(
-        Fx_r_pure, Fy_r_pure, vp.static_loads()[1], vp.tire_long_params_r.mu_x, vp.tire_params_r.mu_y
+        Fx_r_pure, Fy_r_pure, Fzr, vp.tire_long_params_r.mu_x, vp.tire_params_r.mu_y
     )
 
     # Dynamics (documents/3dof.md)
@@ -153,15 +149,13 @@ def derivatives(s: State3DOF, delta_sw: float, vp: Vehicle3DOF) -> Tuple[np.ndar
         (Fx_f * np.sin(df) + Fy_f * np.cos(df)) * vp.a
         - (Fx_r * np.sin(dr) + Fy_r * np.cos(dr)) * vp.b
     )
-    # Add yaw damping torque to approximate self-aligning torque effects
-    r_dot = (Mz - vp.yaw_damp * s.r) / vp.Iz
 
-    # Friction-limited yaw-rate bound: |r| ≤ mu_y * g / U
-    vx_eff = max(vp.U_min, s.vx)
+    # Yaw damping and saturation
+    r_dot = (Mz - vp.yaw_damp * s.r) / vp.Iz
+    # 近零保护使用速度幅值，允许 vx 为负（倒车）
+    vx_eff = max(vp.U_min, abs(s.vx))
     mu_y = min(vp.tire_params_f.mu_y, vp.tire_params_r.mu_y)
-    r_max = mu_y * vp.g / vx_eff
-    if abs(s.r) > r_max:
-        r_dot -= vp.yaw_sat_gain * (abs(s.r) - r_max) * np.sign(s.r)
+    r_dot = apply_yaw_saturation(s.r, r_dot, mu_y, vp.g, vx_eff, vp.yaw_sat_gain)
 
     psi_dot = s.r
     x_dot = s.vx * np.cos(s.psi) - s.vy * np.sin(s.psi)
@@ -170,16 +164,33 @@ def derivatives(s: State3DOF, delta_sw: float, vp: Vehicle3DOF) -> Tuple[np.ndar
     ds = np.array([vx_dot, vy_dot, r_dot, x_dot, y_dot, psi_dot], dtype=float)
     ay = vy_dot + s.r * s.vx
     aux = {
-        "df": df,
-        "dr": dr,
-        "alpha_f": alpha_f,
-        "alpha_r": alpha_r,
-        "Fy_f": Fy_f,
-        "Fy_r": Fy_r,
-        "Fx_f": Fx_f,
-        "Fx_r": Fx_r,
-        "ay": ay,
+        "df": float(df),
+        "dr": float(dr),
+        "alpha_f": float(alpha_f),
+        "alpha_r": float(alpha_r),
+        "Fy_f": float(Fy_f),
+        "Fy_r": float(Fy_r),
+        "Fx_f": float(Fx_f),
+        "Fx_r": float(Fx_r),
+        "ay": float(ay),
     }
+    return ds, aux
+
+
+def derivatives(s: State3DOF, delta_sw: float, vp: Vehicle3DOF) -> Tuple[np.ndarray, Dict[str, float]]:
+    """
+    Compute time derivatives for the 3-DOF nonlinear model using steering wheel input.
+
+    Internally calls derivatives_dfdr(df, dr, ...) to avoid duplication.
+    """
+    df, dr = control_4ws(delta_sw, s.r, vp)
+    # Longitudinal slip ratios provided via closures set by simulate()
+    lmbd_f = derivatives._lambda_f(s)
+    lmbd_r = derivatives._lambda_r(s)
+    Fzf, Fzr = vp.static_loads()
+    Fx_f_pure = pacejka_longitudinal(lmbd_f, Fzf, vp.tire_long_params_f)
+    Fx_r_pure = pacejka_longitudinal(lmbd_r, Fzr, vp.tire_long_params_r)
+    ds, aux = derivatives_dfdr(s, float(df), float(dr), vp, float(Fx_f_pure), float(Fx_r_pure))
     return ds, aux
 
 

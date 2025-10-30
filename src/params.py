@@ -31,7 +31,9 @@ class VehicleParams:
     U: float = 20.0
     mu: float = 0.85
     g: float = 9.81
-    U_min: float = 0.5
+    U_min: float = 1e-3
+    # 低速融合阈值：当 |U| < U_blend 时，逐渐转为几何模型以稳定数值
+    U_blend: float = 0.3
     # 轮胎模型选择：'pacejka'（魔术方程）或 'linear'（线性侧偏刚度）
     tire_model: str = 'pacejka'
 
@@ -40,8 +42,12 @@ class VehicleParams:
         return self.a + self.b
 
     def U_eff(self) -> float:
-        """数值保护下的有效速度。"""
-        return max(self.U, self.U_min)
+        """数值保护下的有效速度幅值（允许 U 为负）。
+
+        - 返回 `max(abs(U), U_min)`，解除 0.5 m/s 下限但保留近零保护。
+        - 这样动力学中的 `r/U` 等项不会在 U→0 时奇异。
+        """
+        return max(abs(self.U), self.U_min)
 
     def understeer_gradient(self) -> float:
         """稳定性因数 K（Understeer Gradient）默认口径。
@@ -63,7 +69,9 @@ class VehicleParams:
         |r| ≤ mu * g / U
         """
         r = self.r_ref(delta_f)
-        r_max = self.mu * self.g / self.U_eff()
+        U_mag = self.U_eff()
+        # 近零速度时不做限幅（返回 +inf），避免过度抑制
+        r_max = float('inf') if U_mag < 1e-6 else float(self.mu * self.g / U_mag)
         return float(np.clip(r, -r_max, r_max))
 
     def to_dict(self) -> dict:
@@ -80,7 +88,14 @@ class VehicleParams:
             "mu": self.mu,
             "g": self.g,
             "U_min": self.U_min,
+            "U_blend": self.U_blend,
             "tire_model": self.tire_model,
             "L": self.L,
             "K": self.understeer_gradient(),
+            # 兼容新增嵌套结构（前端当前不使用，作为附加信息返回）
+            "tire": {
+                "model": self.tire_model,
+                "lateral": {"mu_y": self.mu},
+                "longitudinal": {"mu_x": self.mu},
+            },
         }

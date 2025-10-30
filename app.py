@@ -2,14 +2,29 @@ from flask import Flask, jsonify, request
 from flask import send_from_directory
 from src.params import VehicleParams
 from src.sim import SimEngine
+from src.config import load_config, apply_config, current_config, save_config
 import numpy as np
 import os
 
 app = Flask(__name__, static_folder='web', static_url_path='')
 
-# 全局车辆参数实例（可持久化于内存）
+# 启动时加载配置文件并应用
+def _resolve_cfg_path() -> str:
+    env_path = os.environ.get("SIM_CONFIG_PATH")
+    if env_path:
+        return env_path
+    # 优先使用 YAML（若存在），否则回退 JSON
+    yaml_path = os.path.join(os.getcwd(), "config.yaml")
+    json_path = os.path.join(os.getcwd(), "config.json")
+    if os.path.exists(yaml_path):
+        return yaml_path
+    return json_path
+
+CFG_PATH = _resolve_cfg_path()
+_CFG = load_config(CFG_PATH)
 VP = VehicleParams()
-ENGINE = SimEngine(VP, dt=0.02)
+ENGINE = SimEngine(VP, dt=float((_CFG.get("control") or {}).get("dt", 0.02)))
+apply_config(_CFG, VP, ENGINE)
 
 # 静态首页与静态资源
 @app.route('/')
@@ -21,26 +36,99 @@ def static_proxy(path: str):
     return send_from_directory(app.static_folder, path)
 
 # 获取/更新车辆参数
-@app.route('/api/params', methods=['GET', 'POST'])
+@app.route('/api/params', methods=['GET', 'POST', 'PATCH'])
 def api_params():
     if request.method == 'GET':
         return jsonify(VP.to_dict())
-    # 更新参数（允许部分字段）
     data = request.get_json(force=True) or {}
-    for k in ['m', 'Iz', 'a', 'b', 'width', 'track', 'kf', 'kr', 'U', 'mu', 'g', 'U_min']:
-        if k in data:
-            try:
-                setattr(VP, k, float(data[k]))
-            except (TypeError, ValueError):
-                pass
-    # 非数值参数：轮胎模型选择
-    if 'tire_model' in data:
-        v = str(data['tire_model']).lower().strip()
-        if v in ('pacejka', 'linear'):
-            VP.tire_model = v
-    # 若更新了 U，则同步到控制
-    ENGINE.set_ctrl(U=VP.U)
-    return jsonify(VP.to_dict())
+    if request.method == 'POST':
+        # 兼容旧参数平铺结构
+        for k in ['m', 'Iz', 'a', 'b', 'width', 'track', 'kf', 'kr', 'U', 'mu', 'g', 'U_min', 'U_blend']:
+            if k in data:
+                try:
+                    setattr(VP, k, float(data[k]))
+                except (TypeError, ValueError):
+                    pass
+        # 非数值参数：轮胎模型选择
+        if 'tire_model' in data:
+            v = str(data['tire_model']).lower().strip()
+            if v in ('pacejka', 'linear'):
+                VP.tire_model = v
+        # 若更新了 U，则同步到控制
+        ENGINE.set_ctrl(U=VP.U)
+        # 持久化到配置文件
+        save_config(CFG_PATH, current_config(VP, ENGINE))
+        return jsonify(VP.to_dict())
+    else:
+        # PATCH：支持嵌套结构（tire/control），并兼容平铺更新
+        # 平铺部分（与 POST 相同）
+        for k in ['m', 'Iz', 'a', 'b', 'width', 'track', 'kf', 'kr', 'U', 'mu', 'g', 'U_min', 'U_blend']:
+            if k in data:
+                try:
+                    setattr(VP, k, float(data[k]))
+                except (TypeError, ValueError):
+                    pass
+        if 'tire_model' in data:
+            v = str(data['tire_model']).lower().strip()
+            if v in ('pacejka', 'linear'):
+                VP.tire_model = v
+
+        # 嵌套：tire
+        tire = data.get('tire') or {}
+        if isinstance(tire, dict):
+            # model
+            model = tire.get('model')
+            if isinstance(model, str):
+                v = model.lower().strip()
+                if v in ('pacejka', 'linear'):
+                    VP.tire_model = v
+            # lateral.mu_y
+            lat = tire.get('lateral') or {}
+            if isinstance(lat, dict) and 'mu_y' in lat:
+                try:
+                    VP.mu = float(lat['mu_y'])
+                except (TypeError, ValueError):
+                    pass
+            # longitudinal.mu_x（当前与 mu 统一映射，保留字段以兼容扩展）
+            lon = tire.get('longitudinal') or {}
+            if isinstance(lon, dict) and 'mu_x' in lon:
+                try:
+                    # 简化：先与 mu 同步（未来可拆分为独立字段）
+                    VP.mu = float(lon['mu_x'])
+                except (TypeError, ValueError):
+                    pass
+
+        # 嵌套：control（仿真控制/配置）
+        control = data.get('control') or {}
+        if isinstance(control, dict):
+            for k in ['k_v', 'tau_ctrl', 'tau_low', 'tau_beta', 'yaw_damp', 'yaw_sat_gain', 'drive_bias_front', 'drive_bias_rear']:
+                if k in control:
+                    try:
+                        val = float(control[k])
+                        if k == 'k_v':
+                            ENGINE.k_v = val
+                        elif k == 'tau_ctrl':
+                            ENGINE.tau_ctrl = val
+                        elif k == 'tau_low':
+                            ENGINE.tau_low = val
+                        elif k == 'tau_beta':
+                            ENGINE.tau_beta = val
+                        elif k == 'yaw_damp':
+                            ENGINE.yaw_damp = val
+                        elif k == 'yaw_sat_gain':
+                            ENGINE.yaw_sat_gain = val
+                        elif k == 'drive_bias_front':
+                            ENGINE.drive_bias_front = val
+                        elif k == 'drive_bias_rear':
+                            ENGINE.drive_bias_rear = val
+                    except (TypeError, ValueError):
+                        pass
+
+        # 若更新了 U，则同步到控制
+        ENGINE.set_ctrl(U=VP.U)
+        # 持久化到配置文件
+        save_config(CFG_PATH, current_config(VP, ENGINE))
+        return jsonify(VP.to_dict())
 
 # 派生量与横摆率指令（基于当前参数与输入前轮转角）
 @app.route('/api/derived', methods=['GET'])
@@ -111,6 +199,8 @@ def api_control():
             VP.U = float(U)
         except (TypeError, ValueError):
             pass
+    # 持久化到配置文件
+    save_config(CFG_PATH, current_config(VP, ENGINE))
     return jsonify(ENGINE.get_ctrl())
 
 # 仿真开始/暂停
@@ -167,6 +257,8 @@ def api_track_settings():
     keep = data.get('retentionSec')
     maxp = data.get('maxPoints')
     ENGINE.set_track_settings(enabled=enabled, retention_sec=keep, max_points=maxp)
+    # 持久化到配置文件
+    save_config(CFG_PATH, current_config(VP, ENGINE))
     return jsonify({'ok': True})
 
 # 仿真模式：2DOF / 3DOF
@@ -177,7 +269,17 @@ def api_mode():
     data = request.get_json(force=True) or {}
     mode = data.get('mode')
     ENGINE.set_mode(mode if isinstance(mode, str) else '2dof')
+    # 持久化到配置文件
+    save_config(CFG_PATH, current_config(VP, ENGINE))
     return jsonify({'mode': ENGINE.get_ctrl().get('mode', '2dof')})
+
+# 配置查询（完整 vehicle/control 配置）
+@app.route('/api/config', methods=['GET'])
+def api_config_get():
+    try:
+        return jsonify(current_config(VP, ENGINE))
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 
 if __name__ == '__main__':
