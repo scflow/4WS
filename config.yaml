@@ -1,13 +1,13 @@
 vehicle:
-  m: 1500.0
-  Iz: 2500.0
+  m: 49000.0
+  Iz: 202120.0
   a: 6.0
   b: 6.0
   width: 4.0
   track: 3.4
   kf: 160000.0
   kr: 170000.0
-  U: 5.0
+  U: 4.0
   mu: 0.85
   g: 9.81
   U_min: 0.5
@@ -16,7 +16,7 @@ vehicle:
 control:
   dt: 0.02
   k_v: 0.8
-  tau_ctrl: 0.15
+  tau_ctrl: 0.05
   tau_low: 0.25
   tau_beta: 0.35
   yaw_damp: 220.0

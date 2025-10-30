@@ -3,6 +3,7 @@ from flask import send_from_directory
 from src.params import VehicleParams
 from src.sim import SimEngine
 from src.config import load_config, apply_config, current_config, save_config
+from src.planner import plan_quintic_xy
 import numpy as np
 import os
 
@@ -260,6 +261,87 @@ def api_track_settings():
     # 持久化到配置文件
     save_config(CFG_PATH, current_config(VP, ENGINE))
     return jsonify({'ok': True})
+
+# 参考规划轨迹查询（points: [{t,x,y,psi}]）
+@app.route('/api/plan', methods=['GET'])
+def api_plan_get():
+    try:
+        pts = getattr(ENGINE, 'plan', []) or []
+        return jsonify({'points': pts})
+    except Exception as e:
+        return jsonify({'error': str(e), 'points': []}), 200
+
+# 五次多项式规划：起点-终点（含航向角）生成参考轨迹
+@app.route('/api/plan/quintic', methods=['POST'])
+def api_plan_quintic():
+    data = request.get_json(force=True) or {}
+
+    def parse_pose(obj, fallback=None):
+        if not isinstance(obj, dict):
+            return fallback or {'x': 0.0, 'y': 0.0, 'psi': 0.0}
+        def parse_val(k, d=0.0):
+            try:
+                return float(obj.get(k, d))
+            except (TypeError, ValueError):
+                return d
+        x = parse_val('x', (fallback or {}).get('x', 0.0))
+        y = parse_val('y', (fallback or {}).get('y', 0.0))
+        psi_raw = obj.get('psi', (fallback or {}).get('psi', 0.0))
+        psi_rad = 0.0
+        try:
+            v = float(psi_raw)
+            psi_rad = v * np.pi / 180.0 if abs(v) > np.pi else v
+        except (TypeError, ValueError):
+            psi_rad = float((fallback or {}).get('psi', 0.0))
+        return {'x': x, 'y': y, 'psi': psi_rad}
+
+    # 起点：优先使用传入的 start，否则用当前仿真状态
+    st = ENGINE.get_state()
+    start_default = {'x': float(st['x']), 'y': float(st['y']), 'psi': float(st['psi'])}
+    start = parse_pose(data.get('start'), start_default)
+
+    # 终点：必须传入
+    end = parse_pose(data.get('end'), None)
+    if end is None:
+        return jsonify({'error': 'missing end pose'}), 400
+
+    # 规划时长与采样数
+    # 规划时长 T 已移除：后端自动估算（不再从请求读取）
+    dist = float(np.hypot(end['x'] - start['x'], end['y'] - start['y']))
+    U = float(VP.U)
+    U = max(0.3, abs(U))
+    T = max(1.0, dist / U)
+    T = min(T, 30.0)
+    try:
+        N = int(data.get('N', 200))
+    except (TypeError, ValueError):
+        N = 200
+    N = max(20, N)
+
+    # 规划
+    plan = plan_quintic_xy(start, end, T, N, U_start=float(VP.U))
+    ENGINE.load_plan(plan)
+    return jsonify({'ok': True, 'N': N, 'count': len(plan)})
+
+# 自动跟踪开关/查询（根据参考轨迹沿路输出前后轮角）
+@app.route('/api/autop', methods=['GET', 'POST'])
+def api_autop():
+    if request.method == 'GET':
+        return jsonify({'enabled': bool(ENGINE.autop_enabled), 'mode': getattr(ENGINE, 'autop_mode', 'simple'), 'plan_count': len(getattr(ENGINE, 'plan', []) or [])})
+    data = request.get_json(force=True) or {}
+    enabled = bool(data.get('enabled', True))
+    ENGINE.set_autop(enabled)
+    # 可选：切换模式（'simple' 或 'mpc'）
+    mode = data.get('mode')
+    if isinstance(mode, str):
+        try:
+            ENGINE.set_autop_mode(mode)
+        except Exception:
+            pass
+    # 可选：启动仿真
+    if bool(data.get('start', False)):
+        ENGINE.start()
+    return jsonify({'enabled': bool(ENGINE.autop_enabled), 'mode': getattr(ENGINE, 'autop_mode', 'simple')})
 
 # 仿真模式：2DOF / 3DOF
 @app.route('/api/mode', methods=['GET', 'POST'])

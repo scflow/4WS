@@ -8,12 +8,16 @@ from .params import VehicleParams
 from .model import SimState, Control, TrackSettings
 from .twodof import derivatives as deriv_2dof
 from .dof_utils import body_to_world_2dof, body_to_world_3dof, curvature_4ws
+# from .mpc import solve_mpc_2dof, linearize_2dof
+from .mpc import solve_mpc_kin_dyn_4dof
 from .threedof import (
     Vehicle3DOF,
     State3DOF,
     allocate_drive,
     derivatives_dfdr,
 )
+from .planner import plan_quintic_xy
+from .strategy import ideal_yaw_rate
 
 class SimEngine:
     """后端仿真引擎：维护状态、轨迹与控制，并在后台线程中积分。"""
@@ -39,7 +43,7 @@ class SimEngine:
         self._thread.start()
 
         # 3DOF 控制与稳定性改进：限幅、相位切换、速度跟踪与滤波
-        self.delta_max = np.deg2rad(40.0)  # 轮角限幅（约 20°，提升可达曲率）
+        self.delta_max = np.deg2rad(30.0)  # 轮角限幅（约 25°，提升可达曲率）
         self.U_switch = 8.0                # 高速同相阈值（m/s）
         self.phase_auto = False            # 关闭高速同相覆盖，恢复手动后轮转向
         self.k_v = 0.8                     # 纵向速度跟踪增益（减弱牵引对Fy挤占）
@@ -66,6 +70,29 @@ class SimEngine:
         self.tau_low = 0.25
         self.tau_beta = 0.35
 
+        # 规划与自动跟踪（MPC 占位）：参考轨迹与自动跟踪开关
+        self.plan: List[Dict[str, float]] = []  # 每项 {t, x, y, psi}
+        self.autop_enabled: bool = False
+        self.autop_mode: Literal['simple', 'mpc'] = 'mpc'
+        self._plan_idx: int = 0
+        # 目标位姿与重规划开关
+        self.goal_pose_end: Dict[str, float] | None = None
+        self.replan_every_step: bool = False
+
+
+
+        # 纯追踪/几何参考的预瞄距离参数（可前端/配置调整）
+        self.Ld_k = 0.8                 # 预瞄距离线性系数：Ld = k*U + b
+        self.Ld_b = 4.0                 # 预瞄距离偏置
+        self.Ld_min = 3.0               # 预瞄下限
+        self.Ld_max = 18.0              # 预瞄上限
+
+        # MPC 车速控制：巡航速度、加减速限、横向加速度上限系数
+        self.U_cruise = float(params.U)
+        self.U_max = float(params.U)           # 速度上限：默认等于巡航速度
+        self.dU_max = 1.5                      # m/s 每秒加减速上限
+        self.ay_limit_coeff = 0.85             # 横向加速度占比（mu*g 的比例）
+
     # 线程主循环
     def _loop(self):
         last = time.perf_counter()
@@ -84,6 +111,19 @@ class SimEngine:
     def _step(self, dt: float):
         # 将控制量回写到参数（速度作为 VehicleParams.U）
         self.params.U = float(self.ctrl.U)
+
+        # 自动跟踪：在积分前根据参考轨迹更新 df/dr（支持 2DOF）
+        if self.autop_enabled and len(self.plan) > 0:
+            # 若启用每步重规划，则先根据当前状态与目标位姿重算参考轨迹
+            if self.replan_every_step:
+                try:
+                    self._replan_to_goal()
+                except Exception:
+                    pass
+            if self.autop_mode == 'mpc' and self.mode == '2dof':
+                self._autop_update_mpc()
+            elif self.mode == '2dof':
+                self._autop_update_simple()
 
         # 模式分支：2DOF 线性 或 3DOF 非线性
         if self.mode == '2dof':
@@ -287,11 +327,354 @@ class SimEngine:
                 "mode": self.mode,
             }
 
+    # 规划/自动跟踪接口
+    def load_plan(self, points: List[Dict[str, float]]):
+        """加载参考轨迹：points 为 {t, x, y, psi} 列表。"""
+        with self._lock:
+            self.plan = [
+                {
+                    't': float(p.get('t', 0.0)),
+                    'x': float(p.get('x', 0.0)),
+                    'y': float(p.get('y', 0.0)),
+                    'psi': float(p.get('psi', 0.0)),
+                }
+                for p in points
+            ]
+            self._plan_idx = 0
+            # 存储目标位姿（计划终点），用于每步重规划
+            if len(self.plan) > 0:
+                pend = self.plan[-1]
+                self.goal_pose_end = {
+                    'x': float(pend['x']),
+                    'y': float(pend['y']),
+                    'psi': float(pend.get('psi', 0.0)),
+                }
+
+    def set_autop(self, enabled: bool):
+        with self._lock:
+            self.autop_enabled = bool(enabled)
+            # 移除启用即每步重规划，避免参考轨迹每步从当前点起导致误差始终为零
+            # 默认保持当前重规划设置（初始为 False），如需开启由设置接口控制
+            # self.replan_every_step = bool(enabled)
+
+    def set_autop_mode(self, mode: str):
+        with self._lock:
+            m = str(mode or '').lower()
+            if m in ('simple', 'mpc'):
+                self.autop_mode = m
+            else:
+                # 保底：不识别即保持当前
+                pass
+
+    def _replan_to_goal(self):
+        """基于当前状态与目标位姿进行短周期重规划，减少累积误差。"""
+        # 若没有目标位姿，尝试从现有计划的终点推断
+        if self.goal_pose_end is None:
+            if len(self.plan) == 0:
+                return
+            pend = self.plan[-1]
+            self.goal_pose_end = {
+                'x': float(pend['x']),
+                'y': float(pend['y']),
+                'psi': float(pend.get('psi', 0.0)),
+            }
+
+        # 当前状态作为起点（使用 2DOF 状态）
+        start = {
+            'x': float(self.state2.x),
+            'y': float(self.state2.y),
+            'psi': float(self.state2.psi),
+        }
+        end = dict(self.goal_pose_end)
+
+        # 按当前距离与有效速度估算规划时长 T
+        dist = float(np.hypot(end['x'] - start['x'], end['y'] - start['y']))
+        U_eff = float(max(0.3, abs(self.params.U_eff())))
+        T = float(np.clip(dist / U_eff if U_eff > 1e-6 else 1.0, 0.5, 30.0))
+        # 采样数：与步长匹配，限制范围避免过大
+        N = int(np.clip(T / max(1e-6, self.dt), 60, 400))
+
+        # 生成新计划并替换（起点即当前状态，终点为目标）
+        plan = plan_quintic_xy(start, end, T, N, U_start=float(self.params.U))
+        self.plan = plan
+        self._plan_idx = 0
+
+    def _wrap_angle(self, a: float) -> float:
+        return float((a + np.pi) % (2.0 * np.pi) - np.pi)
+
+    def _plan_ref_geometry(self, x: float, y: float, psi_cur: float, U: float) -> Dict[str, float]:
+        """统一计算参考几何与误差（Frenet风格）。
+
+        返回字典包含：
+        - base_i: 最近点索引（推进用）
+        - ref_i: 预瞄参考段索引（用于计算法线/曲率）
+        - psi_ref: 参考段航向
+        - e_lat: 有符号横向误差（左为正）
+        - psi_err: 航向误差（参考-当前，包角到 [-pi,pi]）
+        - kappa_ref: 参考段曲率估计（dpsi/ds）
+        - Ld: 预瞄距离（m）
+        - ds_ref: 参考段长度（m）
+        """
+        n = len(self.plan)
+        if n < 2:
+            return {
+                'base_i': 0, 'ref_i': 0, 'psi_ref': psi_cur,
+                'e_lat': 0.0, 'psi_err': 0.0, 'kappa_ref': 0.0,
+                'Ld': 5.0, 'ds_ref': 1.0,
+            }
+        # 最近点索引（允许回退）：在 self._plan_idx 附近窗口内搜索最近点
+        start_hint = int(self._plan_idx)
+        window = 200
+        i0 = max(0, start_hint - window)
+        i1 = min(n - 1, start_hint + window)
+        best_i = i0
+        best_d2 = float('inf')
+        for i in range(i0, i1 + 1):
+            px = float(self.plan[i]['x'])
+            py = float(self.plan[i]['y'])
+            d2 = (px - x) * (px - x) + (py - y) * (py - y)
+            if d2 < best_d2:
+                best_d2 = d2
+                best_i = i
+        base_i = int(best_i)
+        self._plan_idx = base_i
+        base_i = max(0, min(n - 2, base_i))
+        # 速度调度的预瞄距离：低速更短，高速更长（夹到范围），由前端/配置可调
+        U_mag = float(max(0.0, abs(U)))
+        Ld = float(np.clip(self.Ld_k * U_mag + self.Ld_b, self.Ld_min, self.Ld_max))
+        # 沿轨迹累计弧长到 Ld，得到参考段索引
+        s_acc = 0.0
+        ref_i = base_i
+        while ref_i < n - 1 and s_acc < Ld:
+            p = self.plan[ref_i]
+            q = self.plan[ref_i + 1]
+            ds_i = float(np.hypot(q['x'] - p['x'], q['y'] - p['y']))
+            s_acc += ds_i
+            if s_acc < Ld:
+                ref_i += 1
+        ref_i = min(ref_i, n - 2)
+
+        # 参考段航向与长度
+        p0 = self.plan[ref_i]
+        p1 = self.plan[ref_i + 1]
+        dx = float(p1['x'] - p0['x']); dy = float(p1['y'] - p0['y'])
+        ds_ref = float(np.hypot(dx, dy))
+        psi_ref = float(np.arctan2(dy, dx)) if ds_ref > 1e-6 else float(p0.get('psi', psi_cur))
+
+        # 横向误差（左法线为正）：n = (-sin psi_ref, cos psi_ref)
+        ex = float(x - p0['x']); ey = float(y - p0['y'])
+        e_lat = float(-ex * np.sin(psi_ref) + ey * np.cos(psi_ref))
+
+        # 航向误差（参考-当前）
+        psi_err = self._wrap_angle(psi_ref - float(psi_cur))
+
+        # 曲率估计：dpsi/ds（使用相邻两段的差分）
+        j_prev = max(0, ref_i - 1)
+        j_next = min(n - 2, ref_i + 1)
+        # 段航向
+        def seg_psi(i: int) -> float:
+            a = self.plan[i]; b = self.plan[i + 1]
+            dx_i = float(b['x'] - a['x']); dy_i = float(b['y'] - a['y'])
+            ds_i = float(np.hypot(dx_i, dy_i))
+            return float(np.arctan2(dy_i, dx_i)) if ds_i > 1e-6 else float(a.get('psi', psi_ref))
+        psi_a = seg_psi(j_prev)
+        psi_b = seg_psi(j_next)
+        dpsi = self._wrap_angle(psi_b - psi_a)
+        ds_a = float(np.hypot(self.plan[j_prev + 1]['x'] - self.plan[j_prev]['x'], self.plan[j_prev + 1]['y'] - self.plan[j_prev]['y']))
+        ds_b = float(np.hypot(self.plan[j_next + 1]['x'] - self.plan[j_next]['x'], self.plan[j_next + 1]['y'] - self.plan[j_next]['y']))
+        ds_avg = max(1e-6, 0.5 * (ds_a + ds_b))
+        kappa_ref = float(dpsi / ds_avg)
+
+        return {
+            'base_i': base_i,
+            'ref_i': ref_i,
+            'psi_ref': psi_ref,
+            'e_lat': e_lat,
+            'psi_err': psi_err,
+            'kappa_ref': kappa_ref,
+            'Ld': Ld,
+            'ds_ref': ds_ref,
+        }
+
+    def _autop_update_simple(self):
+        """纯追踪（Pure Pursuit）：选择预瞄点，用几何公式输出前轮角，后轮用理想横摆补偿。"""
+        if not (self.autop_enabled and self.mode == '2dof' and len(self.plan) > 0):
+            return
+        x = float(self.state2.x)
+        y = float(self.state2.y)
+        psi_cur = float(self.state2.psi)
+        U_signed = float(self.ctrl.U)
+        U_mag = float(self.params.U_eff())
+        ref = self._plan_ref_geometry(x, y, psi_cur, U_mag)
+        # 选择预瞄点为 ref_i+1 的点（更靠前一点更稳定）
+        i_goal = min(len(self.plan) - 1, int(ref['ref_i'] + 1))
+        p_goal = self.plan[i_goal]
+        # 视线角
+        alpha = self._wrap_angle(float(np.arctan2(p_goal['y'] - y, p_goal['x'] - x)) - psi_cur)
+        L = float(self.params.L)
+        Ld = float(max(1.0, ref['Ld']))
+        # 纯追踪前轮角（自行车模型公式）
+        df_cmd_raw = float(np.arctan2(2.0 * L * np.sin(alpha), Ld))
+        df_cmd = float(np.clip(df_cmd_raw, -self.delta_max, self.delta_max))
+        # 后轮理想横摆补偿（基于几何目标曲率）
+        x_vec = np.array([self.state2.beta, self.state2.r], dtype=float)
+        try:
+            dr_cmd_raw, _diag = ideal_yaw_rate(df_cmd, x_vec, self.params)
+        except Exception:
+            dr_cmd_raw = 0.0
+        dr_cmd = float(np.clip(dr_cmd_raw, -self.delta_max, self.delta_max))
+        # 平滑与输出
+        alpha_f = 1.0 - np.exp(-self.dt / max(1e-6, self.tau_ctrl))
+        self._df_filt += alpha_f * (df_cmd - self._df_filt)
+        self._dr_filt += alpha_f * (dr_cmd - self._dr_filt)
+        self.ctrl.delta_f = float(self._df_filt)
+        self.ctrl.delta_r = float(self._dr_filt)
+
+    # 已移除：Stanley 与 PID 自动控制模式
+
+    def _linearize_2dof(self, x_vec: np.ndarray, df0: float, dr0: float) -> tuple[np.ndarray, np.ndarray]:
+        """数值线性化 2DOF：xdot ≈ A x + B u，返回 A(2x2), B(2x2)。"""
+        base = deriv_2dof(x_vec, df0, dr0, self.params)
+        xdot0 = np.array(base["xdot"], dtype=float)
+        nx = 2
+        nu = 2
+        A = np.zeros((nx, nx), dtype=float)
+        B = np.zeros((nx, nu), dtype=float)
+        eps_x = 1e-4
+        eps_u = 1e-3
+        # A: 对状态求导
+        for j in range(nx):
+            x_eps = np.array(x_vec, dtype=float)
+            x_eps[j] += eps_x
+            xdot_eps = np.array(deriv_2dof(x_eps, df0, dr0, self.params)["xdot"], dtype=float)
+            A[:, j] = (xdot_eps - xdot0) / eps_x
+        # B: 对控制求导
+        u0 = np.array([df0, dr0], dtype=float)
+        for j in range(nu):
+            u_eps = np.array(u0, dtype=float)
+            u_eps[j] += eps_u
+            xdot_eps = np.array(deriv_2dof(x_vec, float(u_eps[0]), float(u_eps[1]), self.params)["xdot"], dtype=float)
+            B[:, j] = (xdot_eps - xdot0) / eps_u
+        return A, B
+
+    # def _autop_update_mpc(self):
+    #     """调用外部模块的 MPC 求解，并加卡尔曼滤波与 PID 平滑以抑制抖动。"""
+    #     if not (self.autop_enabled and self.mode == '2dof' and len(self.plan) > 0):
+    #         return
+
+    #     # 原始状态与控制
+    #     state_raw = {
+    #         'x': float(self.state2.x),
+    #         'y': float(self.state2.y),
+    #         'psi': float(self.state2.psi),
+    #         'beta': float(self.state2.beta),
+    #         'r': float(self.state2.r),
+    #     }
+    #     ctrl_raw = {
+    #         'U': float(self.ctrl.U),
+    #         'delta_f': float(self.ctrl.delta_f),
+    #         'delta_r': float(self.ctrl.delta_r),
+    #     }
+
+    #     # 使用原始状态进行 MPC 求解
+    #     state_for_mpc = state_raw
+
+    #     # 求解 MPC 首步控制
+    #     df_cmd, dr_cmd = solve_mpc_2dof(
+    #         state_for_mpc,
+    #         ctrl_raw,
+    #         self.params,
+    #         self.plan,
+    #         self.dt,
+    #         H=12,
+    #         Q_beta=0.1,
+    #         Q_r=1.0,
+    #         Q_psi=2.0,
+    #         R_df=30.0,
+    #         R_dr=30.0,
+    #         R_delta_df=20.0,
+    #         R_delta_dr=20.0,
+    #         delta_max=self.delta_max,
+    #     )
+    #     self.ctrl.delta_f = float(df_cmd)
+    #     self.ctrl.delta_r = float(dr_cmd)
+
+    # def _autop_update_mpc(self):
+    #     """调用外部模块的 MPC 求解（使用 4-DOF 运动学-动力学模型）。"""
+    #     if not (self.autop_enabled and self.mode == '2dof' and len(self.plan) > 0):
+    #         return
+
+    #     # --- 1. 获取当前状态 ---
+    #     state_raw = {
+    #         'x': float(self.state2.x),
+    #         'y': float(self.state2.y),
+    #         'psi': float(self.state2.psi),
+    #         'beta': float(self.state2.beta),
+    #         'r': float(self.state2.r),
+    #     }
+    #     ctrl_raw = {
+    #         'U': float(self.ctrl.U),
+    #         'delta_f': float(self.ctrl.delta_f),
+    #         'delta_r': float(self.ctrl.delta_r),
+    #     }
+    #     U_mag = float(self.params.U_eff())
+
+    #     # --- 2. 计算误差 (e_y, e_psi) ---
+    #     # 调用已有的几何函数
+    #     ref_geom = self._plan_ref_geometry(
+    #         state_raw['x'], 
+    #         state_raw['y'], 
+    #         state_raw['psi'], 
+    #         U_mag
+    #     )
+    #     # e_lat: 左为正, psi_err: ref - cur
+    #     e_y = float(ref_geom['e_lat'])
+    #     e_psi = float(ref_geom['psi_err'])
+
+    #     # --- 3. 构建 4-DOF 增广状态 ---
+    #     state_for_mpc = {
+    #         'x': state_raw['x'],
+    #         'y': state_raw['y'],
+    #         'psi': state_raw['psi'],
+    #         'e_y': e_y,
+    #         'e_psi': e_psi,
+    #         'beta': state_raw['beta'],
+    #         'r': state_raw['r'],
+    #     }
+        
+    #     # --- 4. 求解 MPC ---
+    #     # 注意：这里的权重和以前完全不同！
+    #     # Q_ey 和 Q_epsi 应该是主要驱动力
+    #     # R 和 R_delta 应该相对较小，以允许控制器动作
+    #     df_cmd, dr_cmd = solve_mpc_kin_dyn_4dof(
+    #         state_for_mpc,
+    #         ctrl_raw,
+    #         self.params,
+    #         self.plan,
+    #         self.dt,
+    #         H=12,           # 预测时域
+    #         Q_ey=10.0,      # !! 高横向误差惩罚
+    #         Q_epsi=2.0,     # !! 高航向误差惩罚
+    #         Q_beta=0.1,     # 低侧滑惩罚
+    #         Q_r=0.1,        # 低横摆率惩罚 (主要靠 e_psi)
+    #         R_df=0.5,       # 低控制代价
+    #         R_dr=0.5,       # 低控制代价
+    #         R_delta_df=0.2, # 低控制变化率代价
+    #         R_delta_dr=0.2,
+    #         delta_max=self.delta_max,
+    #     )
+        
+    #     # --- 5. 应用控制 ---
+    #     # 注意：这里我们不再需要平滑，MPC的 R_delta 已经处理了
+    #     self.ctrl.delta_f = float(df_cmd)
+    #     self.ctrl.delta_r = float(dr_cmd)
+
+    
+
     def set_ctrl(self, **kw):
         with self._lock:
             if "U" in kw and kw["U"] is not None:
                 try:
-                    # 3DOF：将 U 作为目标速度，vx 不再瞬时设置
                     self.ctrl.U = float(kw["U"])
                 except (TypeError, ValueError):
                     pass
@@ -311,7 +694,6 @@ class SimEngine:
             if mode in ('2dof', '3dof'):
                 if mode != self.mode:
                     self.mode = mode
-                    # 切换模式时复位轨迹与仿真时间，保持干净状态
                     self.track.clear()
                     self._sim_t = 0.0
         
@@ -341,7 +723,6 @@ class SimEngine:
                 self.state3.x = float(x)
                 self.state3.y = float(y)
                 self.state3.psi = float(psi_rad)
-            # 清空轨迹以避免旧点影响
             self.track.clear()
 
     # 运行控制

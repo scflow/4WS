@@ -27,6 +27,7 @@
             <input type="color" id="ok_color" value="#4caf50" />
           </div>
         </div>
+        <button id="toggle_left_panel" class="btn">折叠参数栏</button>
         <div class="conn-indicator"><span id="conn_dot" class="conn-dot"></span><span class="conn-label">Flask</span></div>
       </div>
     </header>
@@ -49,6 +50,39 @@
           </div>
         </div>
         <button id="apply_init_pose" class="btn primary">应用起始位姿</button>
+      </section>
+
+      <section class="panel">
+        <h2>终点与规划</h2>
+        <div class="control-row">
+          <div class="control">
+            <label for="goal_x">X1 (m)</label>
+            <input type="number" id="goal_x" step="0.1" value="10" />
+          </div>
+          <div class="control">
+            <label for="goal_y">Y1 (m)</label>
+            <input type="number" id="goal_y" step="0.1" value="0" />
+          </div>
+          <div class="control">
+            <label for="goal_psi">ψ1 (deg)</label>
+            <input type="number" id="goal_psi" step="1" value="0" />
+          </div>
+        </div>
+        <div class="control-row">
+          <div class="control">
+          </div>
+          <div class="control">
+            <label for="autop_mode_select">自动控制算法</label>
+            <select id="autop_mode_select">
+              <option value="simple">几何追踪 (Simple)</option>
+              <option value="mpc">MPC</option>
+            </select>
+          </div>
+        </div>
+        <div class="control-row">
+          <button id="plan_start" class="btn ok">规划并开始</button>
+          <button id="autop_stop" class="btn danger">停止自动跟踪</button>
+        </div>
       </section>
 
       <section class="panel">
@@ -145,6 +179,8 @@
         </div>
         <button id="export_track" class="btn ok">导出轨迹 CSV</button>
       </section>
+
+      
     </aside>
 
     <main class="right-panel">
