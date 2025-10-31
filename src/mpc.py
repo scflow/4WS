@@ -44,7 +44,7 @@ def get_kin_dyn_4dof_derivatives(
     x_aug: np.ndarray, 
     u: np.ndarray, 
     params, 
-    r_ref: float,
+    # r_ref: float,
     U: float
 ) -> np.ndarray:
     """
@@ -64,7 +64,7 @@ def get_kin_dyn_4dof_derivatives(
     e_y_dot = U * e_psi + U * beta
 
     # de_psi/dt = r - r_ref
-    e_psi_dot = r - r_ref
+    e_psi_dot = r # - r_ref
 
     # 2. 动力学模型 (Dynamic Model)
     # [beta_dot, r_dot] 来自 twodof
@@ -78,7 +78,7 @@ def linearize_kin_dyn_4dof(
     params, 
     x0_aug: np.ndarray, 
     u0: np.ndarray, 
-    r_ref_0: float, 
+    # r_ref_0: float, 
     dt: float
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
@@ -87,7 +87,7 @@ def linearize_kin_dyn_4dof(
     输入 u = [df, dr]
     """
     U = params.U_eff() # 获取当前速度
-    base = get_kin_dyn_4dof_derivatives(x0_aug, u0, params, r_ref_0, U)
+    base = get_kin_dyn_4dof_derivatives(x0_aug, u0, params, U)
     xdot0 = np.array(base, dtype=float)
     
     nx = 4
@@ -101,14 +101,14 @@ def linearize_kin_dyn_4dof(
     for j in range(nx):
         x_eps = np.array(x0_aug, dtype=float)
         x_eps[j] += eps_x
-        xdot_eps = get_kin_dyn_4dof_derivatives(x_eps, u0, params, r_ref_0, U)
+        xdot_eps = get_kin_dyn_4dof_derivatives(x_eps, u0, params, U)
         A[:, j] = (xdot_eps - xdot0) / eps_x
         
     # B: 对控制 u 求导
     for j in range(nu):
         u_eps = np.array(u0, dtype=float)
         u_eps[j] += eps_u
-        xdot_eps = get_kin_dyn_4dof_derivatives(x0_aug, u_eps, params, r_ref_0, U)
+        xdot_eps = get_kin_dyn_4dof_derivatives(x0_aug, u_eps, params, U)
         B[:, j] = (xdot_eps - xdot0) / eps_u
         
     # 离散化（欧拉）
@@ -177,7 +177,7 @@ def solve_mpc_kin_dyn_4dof(
     # --- 3. 线性化 ---
     # 使用 LTI MPC：只在 k=0 处线性化一次
     r_ref_0 = r_ref_seq[0]
-    A_d, B_d = linearize_kin_dyn_4dof(params, x0_raw, u0, r_ref_0, dt)
+    A_d, B_d = linearize_kin_dyn_4dof(params, x0_raw, u0, dt)
 
     # --- 4. 预测矩阵 Φ 和 T ---
     nx, nu = 4, 2

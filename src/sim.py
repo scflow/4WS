@@ -1,9 +1,7 @@
 import threading
 import time
 from typing import List, Dict, Literal
-
 import numpy as np
-
 from .params import VehicleParams
 from .model import SimState, Control, TrackSettings
 from .twodof import derivatives as deriv_2dof
@@ -21,7 +19,6 @@ from .strategy import ideal_yaw_rate
 
 class SimEngine:
     """后端仿真引擎：维护状态、轨迹与控制，并在后台线程中积分。"""
-
     def __init__(self, params: VehicleParams, dt: float = 0.02):
         self.params = params
         self.dt = float(dt)
@@ -42,8 +39,7 @@ class SimEngine:
         self._thread = threading.Thread(target=self._loop, name="SimLoop", daemon=True)
         self._thread.start()
 
-        # 3DOF 控制与稳定性改进：限幅、相位切换、速度跟踪与滤波
-        self.delta_max = np.deg2rad(30.0)  # 轮角限幅（约 25°，提升可达曲率）
+        self.delta_max = np.deg2rad(30.0)  # 轮角限幅（提升可达曲率）
         self.U_switch = 8.0                # 高速同相阈值（m/s）
         self.phase_auto = False            # 关闭高速同相覆盖，恢复手动后轮转向
         self.k_v = 0.8                     # 纵向速度跟踪增益（减弱牵引对Fy挤占）
@@ -69,7 +65,6 @@ class SimEngine:
         # 低速融合时间常数（s）：yaw 与侧偏的几何/动力学混合
         self.tau_low = 0.25
         self.tau_beta = 0.35
-
         # 规划与自动跟踪（MPC 占位）：参考轨迹与自动跟踪开关
         self.plan: List[Dict[str, float]] = []  # 每项 {t, x, y, psi}
         self.autop_enabled: bool = False
@@ -78,15 +73,11 @@ class SimEngine:
         # 目标位姿与重规划开关
         self.goal_pose_end: Dict[str, float] | None = None
         self.replan_every_step: bool = False
-
-
-
         # 纯追踪/几何参考的预瞄距离参数（可前端/配置调整）
         self.Ld_k = 0.8                 # 预瞄距离线性系数：Ld = k*U + b
         self.Ld_b = 4.0                 # 预瞄距离偏置
         self.Ld_min = 3.0               # 预瞄下限
         self.Ld_max = 18.0              # 预瞄上限
-
         # MPC 车速控制：巡航速度、加减速限、横向加速度上限系数
         self.U_cruise = float(params.U)
         self.U_max = float(params.U)           # 速度上限：默认等于巡航速度
@@ -530,8 +521,6 @@ class SimEngine:
         self.ctrl.delta_f = float(self._df_filt)
         self.ctrl.delta_r = float(self._dr_filt)
 
-    # 已移除：Stanley 与 PID 自动控制模式
-
     def _linearize_2dof(self, x_vec: np.ndarray, df0: float, dr0: float) -> tuple[np.ndarray, np.ndarray]:
         """数值线性化 2DOF：xdot ≈ A x + B u，返回 A(2x2), B(2x2)。"""
         base = deriv_2dof(x_vec, df0, dr0, self.params)
@@ -599,75 +588,74 @@ class SimEngine:
     #     self.ctrl.delta_f = float(df_cmd)
     #     self.ctrl.delta_r = float(dr_cmd)
 
-    # def _autop_update_mpc(self):
-    #     """调用外部模块的 MPC 求解（使用 4-DOF 运动学-动力学模型）。"""
-    #     if not (self.autop_enabled and self.mode == '2dof' and len(self.plan) > 0):
-    #         return
+    def _autop_update_mpc(self):
+        """调用外部模块的 MPC 求解（使用 4-DOF 运动学-动力学模型）。"""
+        if not (self.autop_enabled and self.mode == '2dof' and len(self.plan) > 0):
+            return
 
-    #     # --- 1. 获取当前状态 ---
-    #     state_raw = {
-    #         'x': float(self.state2.x),
-    #         'y': float(self.state2.y),
-    #         'psi': float(self.state2.psi),
-    #         'beta': float(self.state2.beta),
-    #         'r': float(self.state2.r),
-    #     }
-    #     ctrl_raw = {
-    #         'U': float(self.ctrl.U),
-    #         'delta_f': float(self.ctrl.delta_f),
-    #         'delta_r': float(self.ctrl.delta_r),
-    #     }
-    #     U_mag = float(self.params.U_eff())
+        # --- 1. 获取当前状态 ---
+        state_raw = {
+            'x': float(self.state2.x),
+            'y': float(self.state2.y),
+            'psi': float(self.state2.psi),
+            'beta': float(self.state2.beta),
+            'r': float(self.state2.r),
+        }
+        ctrl_raw = {
+            'U': float(self.ctrl.U),
+            'delta_f': float(self.ctrl.delta_f),
+            'delta_r': float(self.ctrl.delta_r),
+        }
+        U_mag = float(self.params.U_eff())
 
-    #     # --- 2. 计算误差 (e_y, e_psi) ---
-    #     # 调用已有的几何函数
-    #     ref_geom = self._plan_ref_geometry(
-    #         state_raw['x'], 
-    #         state_raw['y'], 
-    #         state_raw['psi'], 
-    #         U_mag
-    #     )
-    #     # e_lat: 左为正, psi_err: ref - cur
-    #     e_y = float(ref_geom['e_lat'])
-    #     e_psi = float(ref_geom['psi_err'])
+        # --- 2. 计算误差 (e_y, e_psi) ---
+        # 调用已有的几何函数
+        ref_geom = self._plan_ref_geometry(
+            state_raw['x'], 
+            state_raw['y'], 
+            state_raw['psi'], 
+            U_mag
+        )
+        # e_lat: 左为正, psi_err: ref - cur
+        e_y = float(ref_geom['e_lat'])
+        e_psi = float(ref_geom['psi_err'])
 
-    #     # --- 3. 构建 4-DOF 增广状态 ---
-    #     state_for_mpc = {
-    #         'x': state_raw['x'],
-    #         'y': state_raw['y'],
-    #         'psi': state_raw['psi'],
-    #         'e_y': e_y,
-    #         'e_psi': e_psi,
-    #         'beta': state_raw['beta'],
-    #         'r': state_raw['r'],
-    #     }
+        # --- 3. 构建 4-DOF 增广状态 ---
+        state_for_mpc = {
+            'x': state_raw['x'],
+            'y': state_raw['y'],
+            'psi': state_raw['psi'],
+            'e_y': e_y,
+            'e_psi': e_psi,
+            'beta': state_raw['beta'],
+            'r': state_raw['r'],
+        }
         
-    #     # --- 4. 求解 MPC ---
-    #     # 注意：这里的权重和以前完全不同！
-    #     # Q_ey 和 Q_epsi 应该是主要驱动力
-    #     # R 和 R_delta 应该相对较小，以允许控制器动作
-    #     df_cmd, dr_cmd = solve_mpc_kin_dyn_4dof(
-    #         state_for_mpc,
-    #         ctrl_raw,
-    #         self.params,
-    #         self.plan,
-    #         self.dt,
-    #         H=12,           # 预测时域
-    #         Q_ey=10.0,      # !! 高横向误差惩罚
-    #         Q_epsi=2.0,     # !! 高航向误差惩罚
-    #         Q_beta=0.1,     # 低侧滑惩罚
-    #         Q_r=0.1,        # 低横摆率惩罚 (主要靠 e_psi)
-    #         R_df=0.5,       # 低控制代价
-    #         R_dr=0.5,       # 低控制代价
-    #         R_delta_df=0.2, # 低控制变化率代价
-    #         R_delta_dr=0.2,
-    #         delta_max=self.delta_max,
-    #     )
+        # --- 4. 求解 MPC ---
+        # 注意：这里的权重和以前完全不同！
+        # Q_ey 和 Q_epsi 应该是主要驱动力
+        # R 和 R_delta 应该相对较小，以允许控制器动作
+        df_cmd, dr_cmd = solve_mpc_kin_dyn_4dof(
+            state_for_mpc,
+            ctrl_raw,
+            self.params,
+            self.plan,
+            self.dt,
+            H=12,           # 预测时域
+            Q_ey=10.0,      # !! 高横向误差惩罚
+            Q_epsi=2.0,     # !! 高航向误差惩罚
+            Q_beta=0.1,     # 低侧滑惩罚
+            Q_r=0.1,        # 低横摆率惩罚 (主要靠 e_psi)
+            R_df=10,       # 低控制代价
+            R_dr=10,       # 低控制代价
+            R_delta_df=5000, # 低控制变化率代价
+            R_delta_dr=5000,
+            delta_max=self.delta_max,
+        )
         
-    #     # --- 5. 应用控制 ---
-    #     # 注意：这里我们不再需要平滑，MPC的 R_delta 已经处理了
-    #     self.ctrl.delta_f = float(df_cmd)
-    #     self.ctrl.delta_r = float(dr_cmd)
+        # --- 5. 应用控制 ---
+        self.ctrl.delta_f = float(df_cmd)
+        self.ctrl.delta_r = float(dr_cmd)
 
     
 
