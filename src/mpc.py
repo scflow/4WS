@@ -41,11 +41,11 @@ def linearize_2dof(params, x_vec: np.ndarray, df0: float, dr0: float, dt: float)
 # --- 新的 4-DOF 轨迹跟踪模型 ---
 
 def get_kin_dyn_4dof_derivatives(
-    x_aug: np.ndarray, 
-    u: np.ndarray, 
-    params, 
-    # r_ref: float,
-    U: float
+    x_aug: np.ndarray,
+    u: np.ndarray,
+    params,
+    U: float,
+    r_ref: float,
 ) -> np.ndarray:
     """
     计算 4-DOF 增广状态的导数: x_aug = [e_y, e_psi, beta, r]
@@ -55,16 +55,12 @@ def get_kin_dyn_4dof_derivatives(
     df, dr = float(u[0]), float(u[1])
     
     # 1. 运动学误差模型 (Kinematic Error Model)
-    # 假设 U 恒定 (来自 params)
-    # de_y/dt = V * sin(e_psi) + V_y (其中 V_y = V * beta)
-    # 我们线性化：sin(e_psi) ≈ e_psi, cos(e_psi) ≈ 1
-    # V_y_global = (U * beta) * cos(e_psi) - (U) * sin(e_psi) <-- 这个太复杂
-    # 简化版：de_y/dt ≈ U * e_psi + U * beta 
-    # (U*e_psi 来自航向误差, U*beta 来自侧滑)
-    e_y_dot = U * e_psi + U * beta
+    # 统一误差定义：e_psi = psi_ref - psi_cur
+    # 线性近似下：e_y_dot ≈ U * (beta - e_psi)
+    e_y_dot = U * (beta - e_psi)
 
-    # de_psi/dt = r - r_ref
-    e_psi_dot = r # - r_ref
+    # e_psi 动态：e_psi_dot ≈ -r + r_ref（其中 r_ref ≈ U * kappa_ref）
+    e_psi_dot = -r + r_ref
 
     # 2. 动力学模型 (Dynamic Model)
     # [beta_dot, r_dot] 来自 twodof
@@ -75,19 +71,19 @@ def get_kin_dyn_4dof_derivatives(
     return np.array([e_y_dot, e_psi_dot, beta_dot, r_dot])
 
 def linearize_kin_dyn_4dof(
-    params, 
-    x0_aug: np.ndarray, 
-    u0: np.ndarray, 
-    # r_ref_0: float, 
-    dt: float
+    params,
+    x0_aug: np.ndarray,
+    u0: np.ndarray,
+    dt: float,
+    U: float,
+    r_ref_0: float,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     数值线性化 4-DOF 轨迹跟踪模型 (LTI)
     状态 x_aug = [e_y, e_psi, beta, r]
     输入 u = [df, dr]
     """
-    U = params.U_eff() # 获取当前速度
-    base = get_kin_dyn_4dof_derivatives(x0_aug, u0, params, U)
+    base = get_kin_dyn_4dof_derivatives(x0_aug, u0, params, U, r_ref_0)
     xdot0 = np.array(base, dtype=float)
     
     nx = 4
@@ -101,14 +97,14 @@ def linearize_kin_dyn_4dof(
     for j in range(nx):
         x_eps = np.array(x0_aug, dtype=float)
         x_eps[j] += eps_x
-        xdot_eps = get_kin_dyn_4dof_derivatives(x_eps, u0, params, U)
+        xdot_eps = get_kin_dyn_4dof_derivatives(x_eps, u0, params, U, r_ref_0)
         A[:, j] = (xdot_eps - xdot0) / eps_x
         
     # B: 对控制 u 求导
     for j in range(nu):
         u_eps = np.array(u0, dtype=float)
         u_eps[j] += eps_u
-        xdot_eps = get_kin_dyn_4dof_derivatives(x0_aug, u_eps, params, U)
+        xdot_eps = get_kin_dyn_4dof_derivatives(x0_aug, u_eps, params, U, r_ref_0)
         B[:, j] = (xdot_eps - xdot0) / eps_u
         
     # 离散化（欧拉）
@@ -157,27 +153,37 @@ def solve_mpc_kin_dyn_4dof(
     x = float(state_aug.get('x', 0.0))
     y = float(state_aug.get('y', 0.0))
     psi0 = float(state_aug.get('psi', 0.0))
-    U = params.U_eff()
+    U_signed = float(params.U)
     
     base_i = nearest_plan_index(plan, x, y)
     i_start = min(base_i + 1, len(plan) - 1)
 
+    # 参考横摆率：基于曲率 kappa ≈ dpsi/ds，r_ref = U_signed * kappa
     r_ref_seq = np.zeros(H, dtype=float)
-    # 我们需要 H+1 个点来计算 H 个 r_ref
-    psi_list: List[float] = []
-    for k in range(H + 1):
-        i_k = min(len(plan) - 1, i_start + k)
-        psi_list.append(float(plan[i_k].get('psi', psi0)))
-
+    n_plan = len(plan)
+    def seg_psi(i: int) -> float:
+        a = plan[i]
+        b = plan[i + 1]
+        dx_i = float(b['x'] - a['x']); dy_i = float(b['y'] - a['y'])
+        ds_i = float(np.hypot(dx_i, dy_i))
+        return float(np.arctan2(dy_i, dx_i)) if ds_i > 1e-6 else float(a.get('psi', psi0))
     for k in range(H):
-        dpsi_k = wrap(psi_list[k + 1] - psi_list[k])
-        # r_ref = dpsi/dt = dpsi/(ds/V) = V * (dpsi/ds) = V * kappa
-        r_ref_seq[k] = dpsi_k / max(float(dt), 1e-6)
+        idx_center = min(n_plan - 2, i_start + k)
+        j_prev = max(0, idx_center - 1)
+        j_next = min(n_plan - 2, idx_center + 1)
+        psi_a = seg_psi(j_prev)
+        psi_b = seg_psi(j_next)
+        dpsi = wrap(psi_b - psi_a)
+        ds_a = float(np.hypot(plan[j_prev + 1]['x'] - plan[j_prev]['x'], plan[j_prev + 1]['y'] - plan[j_prev]['y']))
+        ds_b = float(np.hypot(plan[j_next + 1]['x'] - plan[j_next]['x'], plan[j_next + 1]['y'] - plan[j_next]['y']))
+        ds_avg = max(1e-6, 0.5 * (ds_a + ds_b))
+        kappa_ref = float(dpsi / ds_avg)
+        r_ref_seq[k] = float(U_signed * kappa_ref)
 
     # --- 3. 线性化 ---
     # 使用 LTI MPC：只在 k=0 处线性化一次
-    r_ref_0 = r_ref_seq[0]
-    A_d, B_d = linearize_kin_dyn_4dof(params, x0_raw, u0, dt)
+    r_ref_0 = float(r_ref_seq[0])
+    A_d, B_d = linearize_kin_dyn_4dof(params, x0_raw, u0, dt, U_signed, r_ref_0)
 
     # --- 4. 预测矩阵 Φ 和 T ---
     nx, nu = 4, 2

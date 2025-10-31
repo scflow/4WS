@@ -616,9 +616,24 @@ class SimEngine:
             state_raw['psi'], 
             U_mag
         )
-        # e_lat: 左为正, psi_err: ref - cur
-        e_y = float(ref_geom['e_lat'])
-        e_psi = float(ref_geom['psi_err'])
+        # 使用最近点作为误差锚点，避免预瞄段掩盖真实偏差
+        try:
+            n_plan = len(self.plan)
+            base_i = int(ref_geom.get('base_i', 0))
+            i_seg = max(0, min(n_plan - 2, base_i))
+            p0 = self.plan[i_seg]
+            p1 = self.plan[i_seg + 1]
+            dx = float(p1['x'] - p0['x']); dy = float(p1['y'] - p0['y'])
+            ds = float(np.hypot(dx, dy))
+            psi_base = float(np.arctan2(dy, dx)) if ds > 1e-6 else float(p0.get('psi', state_raw['psi']))
+            ex = float(state_raw['x'] - p0['x']); ey = float(state_raw['y'] - p0['y'])
+            # e_y: 左法线为正；e_psi: 参考 - 当前（与 MPC 模型一致）
+            e_y = float(-ex * np.sin(psi_base) + ey * np.cos(psi_base))
+            e_psi = float(self._wrap_angle(psi_base - float(state_raw['psi'])))
+        except Exception:
+            # 回退到预瞄段误差
+            e_y = float(ref_geom['e_lat'])
+            e_psi = float(ref_geom['psi_err'])
 
         # --- 3. 构建 4-DOF 增广状态 ---
         state_for_mpc = {
@@ -641,15 +656,15 @@ class SimEngine:
             self.params,
             self.plan,
             self.dt,
-            H=12,           # 预测时域
-            Q_ey=10.0,      # !! 高横向误差惩罚
-            Q_epsi=2.0,     # !! 高航向误差惩罚
-            Q_beta=0.1,     # 低侧滑惩罚
+            H=20,           # 预测时域
+            Q_ey=100,      # !! 高横向误差惩罚
+            Q_epsi=500,     # !! 高航向误差惩罚
+            Q_beta=20,     # 低侧滑惩罚
             Q_r=0.1,        # 低横摆率惩罚 (主要靠 e_psi)
-            R_df=10,       # 低控制代价
-            R_dr=10,       # 低控制代价
-            R_delta_df=5000, # 低控制变化率代价
-            R_delta_dr=5000,
+            R_df=2,       # 低控制代价
+            R_dr=2,       # 低控制代价
+            R_delta_df=0.2, # 低控制变化率代价
+            R_delta_dr=0.2,
             delta_max=self.delta_max,
         )
         
