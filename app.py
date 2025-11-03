@@ -3,7 +3,7 @@ from flask import send_from_directory
 from src.params import VehicleParams
 from src.sim import SimEngine
 from src.config import load_config, apply_config, current_config, save_config
-from src.planner import plan_quintic_xy
+from src.planner import plan_quintic_xy, plan_circle_arc
 import numpy as np
 import os
 
@@ -320,6 +320,56 @@ def api_plan_quintic():
 
     # 规划
     plan = plan_quintic_xy(start, end, T, N, U_start=float(VP.U))
+    ENGINE.load_plan(plan)
+    return jsonify({'ok': True, 'N': N, 'count': len(plan)})
+
+# 圆弧规划：以起点/终点位置与航向角生成圆弧参考轨迹
+@app.route('/api/plan/circle', methods=['POST'])
+def api_plan_circle():
+    data = request.get_json(force=True) or {}
+
+    def parse_pose(obj, fallback=None):
+        if not isinstance(obj, dict):
+            return fallback or {'x': 0.0, 'y': 0.0, 'psi': 0.0}
+        def parse_val(k, d=0.0):
+            try:
+                return float(obj.get(k, d))
+            except (TypeError, ValueError):
+                return d
+        x = parse_val('x', (fallback or {}).get('x', 0.0))
+        y = parse_val('y', (fallback or {}).get('y', 0.0))
+        psi_raw = obj.get('psi', (fallback or {}).get('psi', 0.0))
+        psi_rad = 0.0
+        try:
+            v = float(psi_raw)
+            psi_rad = v * np.pi / 180.0 if abs(v) > np.pi else v
+        except (TypeError, ValueError):
+            psi_rad = float((fallback or {}).get('psi', 0.0))
+        return {'x': x, 'y': y, 'psi': psi_rad}
+
+    # 起点：优先使用传入的 start，否则用当前仿真状态
+    st = ENGINE.get_state()
+    start_default = {'x': float(st['x']), 'y': float(st['y']), 'psi': float(st['psi'])}
+    start = parse_pose(data.get('start'), start_default)
+
+    # 终点：必须传入
+    end = parse_pose(data.get('end'), None)
+    if end is None:
+        return jsonify({'error': 'missing end pose'}), 400
+
+    # 采样数（圆弧内部自用 T，外部传入 T 作为时间标签均匀分布）
+    dist = float(np.hypot(end['x'] - start['x'], end['y'] - start['y']))
+    U = float(VP.U)
+    U = max(0.3, abs(U))
+    T = max(1.0, dist / U)
+    T = min(T, 30.0)
+    try:
+        N = int(data.get('N', 200))
+    except (TypeError, ValueError):
+        N = 200
+    N = max(20, N)
+
+    plan = plan_circle_arc(start, end, T, N, U_start=float(VP.U))
     ENGINE.load_plan(plan)
     return jsonify({'ok': True, 'N': N, 'count': len(plan)})
 

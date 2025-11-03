@@ -70,6 +70,13 @@
         </div>
         <div class="control-row">
           <div class="control">
+            <label for="plan_method_select">轨迹生成方法</label>
+            <select id="plan_method_select">
+              <option value="quintic">五次多项式</option>
+              <option value="circle">圆弧</option>
+            </select>
+          </div>
+          <div class="control">
           </div>
           <div class="control">
             <label for="autop_mode_select">自动控制算法</label>
@@ -80,7 +87,8 @@
           </div>
         </div>
         <div class="control-row">
-          <button id="plan_start" class="btn ok">规划并开始</button>
+          <button id="plan_only" class="btn ok">规划</button>
+          <button id="autop_start" class="btn ok">开始自动跟踪</button>
           <button id="autop_stop" class="btn danger">停止自动跟踪</button>
         </div>
       </section>

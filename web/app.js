@@ -158,7 +158,9 @@ function bindUI() {
   const goalX = document.getElementById('goal_x');
   const goalY = document.getElementById('goal_y');
   const goalPsi = document.getElementById('goal_psi');
-  const planBtn = document.getElementById('plan_start');
+  const planOnlyBtn = document.getElementById('plan_only');
+  const autopStartBtn = document.getElementById('autop_start');
+  const planMethodSel = document.getElementById('plan_method_select');
   // 规划时长 T 已移除，由后端自动估算
   const autopModeSel = document.getElementById('autop_mode_select');
   const autopStopBtn = document.getElementById('autop_stop');
@@ -173,25 +175,37 @@ function bindUI() {
       try { await fetch('/api/autop', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode: autopModeSel.value }) }); } catch {}
     });
   }
-  planBtn.addEventListener('click', async () => {
-    const x0 = parseFloat(initX.value) || 0;
-    const y0 = parseFloat(initY.value) || 0;
-    const psi0deg = parseFloat(initPsi.value) || 0;
-    const x1 = parseFloat(goalX.value) || 0;
-    const y1 = parseFloat(goalY.value) || 0;
-    const psi1deg = parseFloat(goalPsi.value) || 0;
-    try {
-      const res = await fetch('/api/plan/quintic', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ start: { x: x0, y: y0, psi: psi0deg }, end: { x: x1, y: y1, psi: psi1deg } }) });
-      if (res.ok) {
+  if (planOnlyBtn) {
+    planOnlyBtn.addEventListener('click', async () => {
+      const x0 = parseFloat(initX.value) || 0;
+      const y0 = parseFloat(initY.value) || 0;
+      const psi0deg = parseFloat(initPsi.value) || 0;
+      const x1 = parseFloat(goalX.value) || 0;
+      const y1 = parseFloat(goalY.value) || 0;
+      const psi1deg = parseFloat(goalPsi.value) || 0;
+      const method = (planMethodSel && planMethodSel.value) || 'quintic';
+      const url = method === 'circle' ? '/api/plan/circle' : '/api/plan/quintic';
+      try {
+        const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ start: { x: x0, y: y0, psi: psi0deg }, end: { x: x1, y: y1, psi: psi1deg } }) });
+        if (res.ok) {
+          // 仅规划不启动自动跟踪；重置到达状态与动画
+          arrived = false; arriveTick = 0; arrivalAnim.active = false; arrivalAnim.t0 = 0;
+          // 聚焦车辆视图
+          view.follow = true; centerOnVehicle();
+        }
+      } catch (e) { console.warn('规划失败', e); }
+    });
+  }
+  if (autopStartBtn) {
+    autopStartBtn.addEventListener('click', async () => {
+      try {
         const mode = (autopModeSel && autopModeSel.value) || 'mpc';
         await fetch('/api/autop', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: true, start: true, mode }) });
         ctrl.running = true; startPauseBtn.textContent = '暂停';
         view.follow = true; centerOnVehicle();
-        // 新规划开始时重置到达状态与动画
-        arrived = false; arriveTick = 0; arrivalAnim.active = false; arrivalAnim.t0 = 0;
-      }
-    } catch (e) { console.warn('规划失败', e); }
-  });
+      } catch (e) { console.warn('启动自动跟踪失败', e); }
+    });
+  }
   autopStopBtn.addEventListener('click', async () => {
     try {
       // 1) 关闭自动跟踪
