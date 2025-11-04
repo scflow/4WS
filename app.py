@@ -149,6 +149,26 @@ def api_derived():
 def api_state():
     return jsonify(ENGINE.get_state())
 
+# 遥测采样：提供前端无法直接获取的数据（含导数）
+@app.route('/api/telemetry', methods=['GET'])
+def api_telemetry():
+    st = ENGINE.get_state()
+    ct = ENGINE.get_ctrl()
+    # 统一返回所需字段：u、坐标、航向角、前后轮角、beta_dot、r_dot
+    return jsonify({
+        'U': float(ct.get('U', 0.0)),
+        'x': float(st.get('x', 0.0)),
+        'y': float(st.get('y', 0.0)),
+        'psi': float(st.get('psi', 0.0)),
+        'df': float(st.get('df', 0.0)),
+        'dr': float(st.get('dr', 0.0)),
+        'beta_dot': float(st.get('beta_dot', 0.0)),
+        'r_dot': float(st.get('r_dot', 0.0)),
+        # 备用：提供实际速度与半径，便于分析（列不强制）
+        'speed': float(st.get('speed', ct.get('U', 0.0))),
+        'radius': st.get('radius') if st.get('radius') is not None else None,
+    })
+
 # 控制量查询/更新（U, df, dr, running）
 @app.route('/api/control', methods=['GET', 'POST'])
 def api_control():

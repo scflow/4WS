@@ -15,6 +15,9 @@ let ctrl = { U: 20, df: 0, dr: 0, running: false };
 let track = [];
 let plan = [];
 const trackCfg = { enabled: true, retentionSec: 30, maxPoints: 20000 };
+// 遥测缓冲与设置
+let telemetry = [];
+const telemetryCfg = { enabled: false, retentionSec: 30, timer: null };
 // 到达终点检测与动画状态
 let arrived = false;
 let arriveTick = 0;
@@ -253,6 +256,64 @@ function bindUI() {
   if (exportBtn) {
     exportBtn.addEventListener('click', () => { try { exportTrackCSV(); } catch (e) {} });
   }
+
+  // 遥测：保留时长设置与控制按钮
+  const telKeepInput = document.getElementById('telemetry_keep_sec');
+  const telStartBtn = document.getElementById('telemetry_start');
+  const telStopBtn = document.getElementById('telemetry_stop');
+  const telExportBtn = document.getElementById('export_telemetry');
+  const telStats = document.getElementById('telemetry_stats');
+  if (telKeepInput) {
+    const v = parseFloat(telKeepInput.value);
+    if (!Number.isNaN(v)) telemetryCfg.retentionSec = Math.max(0, v);
+    telKeepInput.addEventListener('change', () => {
+      const n = parseFloat(telKeepInput.value);
+      telemetryCfg.retentionSec = Number.isNaN(n) ? telemetryCfg.retentionSec : Math.max(0, n);
+    });
+  }
+  function updateTelStats() {
+    if (telStats) telStats.textContent = `${telemetry.length} 条`;
+  }
+  async function pollTelemetryOnce() {
+    try {
+      const res = await fetch('/api/telemetry', { cache: 'no-store' });
+      if (!res.ok) return;
+      const d = await res.json();
+      const now = performance.now();
+      telemetry.push({
+        t_ms: now,
+        U: Number(d.U ?? 0),
+        x: Number(d.x ?? 0),
+        y: Number(d.y ?? 0),
+        psi: Number(d.psi ?? 0),
+        df: Number(d.df ?? 0),
+        dr: Number(d.dr ?? 0),
+        beta_dot: Number(d.beta_dot ?? 0),
+        r_dot: Number(d.r_dot ?? 0),
+        speed: Number(d.speed ?? (d.U ?? 0)),
+        radius: (typeof d.radius === 'number') ? Number(d.radius) : null,
+      });
+      // 保留最近时长
+      const keepMs = telemetryCfg.retentionSec * 1000;
+      const cutoff = now - keepMs;
+      let i = 0;
+      while (i < telemetry.length && telemetry[i].t_ms < cutoff) i++;
+      if (i > 0) telemetry.splice(0, i);
+      updateTelStats();
+    } catch (e) {}
+  }
+  function startTelemetry() {
+    if (telemetryCfg.timer) return;
+    telemetryCfg.enabled = true;
+    telemetryCfg.timer = setInterval(pollTelemetryOnce, 100);
+  }
+  function stopTelemetry() {
+    telemetryCfg.enabled = false;
+    if (telemetryCfg.timer) { clearInterval(telemetryCfg.timer); telemetryCfg.timer = null; }
+  }
+  if (telStartBtn) telStartBtn.addEventListener('click', startTelemetry);
+  if (telStopBtn) telStopBtn.addEventListener('click', stopTelemetry);
+  if (telExportBtn) telExportBtn.addEventListener('click', () => { try { exportTelemetryCSV(); } catch (e) {} });
 
   // 已移除：自动跟踪调度（Stanley & PID），仅保留 MPC 选项
 
@@ -657,6 +718,44 @@ function exportTrackCSV() {
     setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 0);
   } catch (e) {
     console.warn('导出 CSV 失败', e);
+    alert('导出失败，请稍后重试');
+  }
+}
+
+// 导出当前保留的遥测为 CSV 文件
+function exportTelemetryCSV() {
+  try {
+    if (!Array.isArray(telemetry) || telemetry.length === 0) { alert('当前无可导出的遥测'); return; }
+    const t0 = telemetry[0].t_ms;
+    const rows = [];
+    rows.push('t_ms,U,x,y,psi,df,dr,beta_dot,r_dot,speed,radius');
+    for (let i = 0; i < telemetry.length; i++) {
+      const p = telemetry[i] || {};
+      const t = (typeof p.t_ms === 'number') ? (p.t_ms - t0).toFixed(0) : '';
+      const U = (typeof p.U === 'number') ? p.U : '';
+      const x = (typeof p.x === 'number') ? p.x : '';
+      const y = (typeof p.y === 'number') ? p.y : '';
+      const psi = (typeof p.psi === 'number') ? p.psi : '';
+      const df = (typeof p.df === 'number') ? p.df : '';
+      const dr = (typeof p.dr === 'number') ? p.dr : '';
+      const beta_dot = (typeof p.beta_dot === 'number') ? p.beta_dot : '';
+      const r_dot = (typeof p.r_dot === 'number') ? p.r_dot : '';
+      const speed = (typeof p.speed === 'number') ? p.speed : '';
+      const radius = (typeof p.radius === 'number') ? p.radius : '';
+      rows.push(`${t},${U},${x},${y},${psi},${df},${dr},${beta_dot},${r_dot},${speed},${radius}`);
+    }
+    const csv = rows.join('\n');
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    const ts = new Date().toISOString().replace(/[:.]/g, '-');
+    a.download = `telemetry_${ts}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 0);
+  } catch (e) {
+    console.warn('导出遥测 CSV 失败', e);
     alert('导出失败，请稍后重试');
   }
 }

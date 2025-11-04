@@ -188,6 +188,26 @@
         <button id="export_track" class="btn ok">导出轨迹 CSV</button>
       </section>
 
+      <section class="panel">
+        <h2>遥测记录</h2>
+        <div class="control-row">
+          <div class="control">
+            <label for="telemetry_keep_sec">保留时长 (s)</label>
+            <input type="number" id="telemetry_keep_sec" step="1" value="30" />
+          </div>
+          <div class="control">
+            <label>采样</label>
+            <div id="telemetry_stats" class="small">0 条</div>
+          </div>
+        </div>
+        <div class="control-row">
+          <button id="telemetry_start" class="btn ok">开始记录</button>
+          <button id="telemetry_stop" class="btn danger">停止记录</button>
+          <button id="export_telemetry" class="btn">导出遥测 CSV</button>
+        </div>
+        <p class="hint small">记录字段：u、x、y、ψ、δf、δr、β̇、ṙ</p>
+      </section>
+
       
     </aside>
 

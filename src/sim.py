@@ -58,6 +58,9 @@ class SimEngine:
         self._dr_dot = 0.0
         self._speed = float(self.params.U)
         self._radius: float | None = None
+        # 导数采样：beta_dot 与 r_dot（用于前端导出 CSV）
+        self._beta_dot = 0.0
+        self._r_dot = 0.0
 
         # 牵引分配：后轴为主；按转角对齐车体轴衰减前轴扭矩（减小纵向致转力矩并保留侧向容量）
         self.drive_bias_front = 0.1        # 前轴基础牵引比例
@@ -142,6 +145,10 @@ class SimEngine:
             beta_dot = w * beta_dot + (1.0 - w) * beta_dot_kin
             r_dot = w * r_dot + (1.0 - w) * r_dot_kin
 
+            # 记录导数（用于遥测）
+            self._beta_dot = float(beta_dot)
+            self._r_dot = float(r_dot)
+
             self.state2.beta += beta_dot * dt
             self.state2.r += r_dot * dt
             self.state2.psi += psi_dot * dt
@@ -159,6 +166,9 @@ class SimEngine:
             Ueff = self.params.U_eff()
             self._speed = Ueff
             self._radius = (Ueff / abs(self.state2.r)) if abs(self.state2.r) > 1e-6 else None
+
+            # 仿真时间推进
+            self._sim_t += dt
 
             if self.track_cfg.enabled:
                 self._push_track_point(self.state2.x, self.state2.y)
@@ -246,6 +256,11 @@ class SimEngine:
             self._speed = float(np.hypot(self.state3.vx, self.state3.vy))
             self._radius = (self._speed / abs(self.state3.r)) if abs(self.state3.r) > 1e-6 else None
 
+            # 记录导数（3DOF）：beta_dot 由 atan2(vy,vx) 求导；r_dot 已上方计算
+            denom = float(self.state3.vx * self.state3.vx + self.state3.vy * self.state3.vy + 1e-9)
+            self._beta_dot = float((self.state3.vx * vy_dot - self.state3.vy * vx_dot) / denom)
+            self._r_dot = float(r_dot)
+
             # 仿真时间推进（保留用于后续可能的功能）
             self._sim_t += dt
 
@@ -279,6 +294,8 @@ class SimEngine:
                     "psi": self.state2.psi,  # rad
                     "beta": self.state2.beta,
                     "r": self.state2.r,
+                    "beta_dot": self._beta_dot,
+                    "r_dot": self._r_dot,
                     "speed": self._speed,
                     "radius": self._radius if self._radius is not None else None,
                     "df": self._df_cur,
@@ -295,6 +312,8 @@ class SimEngine:
                     "psi": self.state3.psi,
                     "beta": beta,
                     "r": self.state3.r,
+                    "beta_dot": self._beta_dot,
+                    "r_dot": self._r_dot,
                     "speed": self._speed,
                     "radius": self._radius if self._radius is not None else None,
                     "df": self._df_cur,
