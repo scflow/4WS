@@ -25,7 +25,7 @@ class MPPIController4WS:
         dU_max: float,
         U_max: float,
         device: Optional[str] = None,
-        num_samples: int = 16,
+        num_samples: int = 2500,
         horizon: int = 20,
         lambda_: float = 120.0,
         delta_rate_frac: float = 0.5,
@@ -48,9 +48,10 @@ class MPPIController4WS:
 
         self.w_lat = 2000.0
         self.w_head = 4000.0
-        self.w_speed = 20.0
+        # 直线速度激励（机会成本），弯道弱化
+        self.w_speed = 12.0
         self.w_u = 1.0
-        self.w_du = 2.0
+        self.w_du = 3.0
         # 速度相关的相位约束（低速更强反相，高速弱同相）
         self.w_phase_base = 300.0
         self.k_low = -0.30
@@ -58,8 +59,18 @@ class MPPIController4WS:
         self.U1 = 5.0
         self.U2 = 20.0
         # 额外约束：直接惩罚同相（df、dr 同号）与加入理想横摆率前馈
-        self.w_phase_sign = 120.0
-        self.w_yaw_ff = 80.0
+        self.w_phase_sign = 180.0
+        self.w_yaw_ff = 60.0
+
+        # 曲率门控与蟹行/稳定性权重
+        self.kappa_turn_k0 = 0.02   # 转弯门控起始阈值 [1/m]
+        self.kappa_turn_k1 = 0.06   # 转弯门控满载阈值 [1/m]
+        self.w_yaw_track = 2400.0   # 强制 r ≈ U*kappa_ref
+        self.w_crab = 220.0         # 弯道蟹行抑制 (df+dr)^2
+        self.w_ay = 120.0           # 弯道横向加速度代价 ay^2
+        self.w_beta = 10.0          # 弯道侧偏角代价 beta^2
+        self.w_dU_turn = 1.2        # 弯道加速变化惩罚 dU^2
+        self.k_max = 0.8            # 弯道相位比例的最大反相幅度
 
         # 控制噪声协方差（三维动作，使用微分形式）
         noise_sigma = torch.diag(torch.tensor([
@@ -224,35 +235,51 @@ class MPPIController4WS:
         e_psi_t = torch.tensor(e_psi_list, dtype=s.dtype, device=s.device)
         U_des_t = torch.tensor(U_des_list, dtype=s.dtype, device=s.device)
 
-        # 曲率误差近似：由当前 r/U 近似 kappa
-        kappa_cur = torch.abs(s[..., 4] / torch.clamp(s[..., 5], min=1e-6))
-        kappa_ref_t = torch.tensor(np.abs(kappa_ref_list), dtype=s.dtype, device=s.device)
+        # 曲率与门控（使用有符号曲率以约束方向一致性）
+        kappa_cur_signed = s[..., 4] / torch.clamp(s[..., 5], min=1e-6)
+        kappa_ref_t_signed = torch.tensor(kappa_ref_list, dtype=s.dtype, device=s.device)
+        kappa_ref_mag = torch.abs(kappa_ref_t_signed)
+        # 曲率门控：在 |kappa_ref| 较大时增强转弯相关惩罚
+        G_turn = torch.clamp((kappa_ref_mag - self.kappa_turn_k0) / (self.kappa_turn_k1 - self.kappa_turn_k0 + 1e-9), 0.0, 1.0)
+        G_straight = 1.0 - 0.7 * G_turn
 
-        # 代价项（提高曲率跟踪权重、减小横摆率惩罚）
+        # 基础几何跟踪
         cost = (
             self.w_lat * (e_y_t ** 2) +
             self.w_head * (e_psi_t ** 2) +
-            24.0 * ((kappa_cur - kappa_ref_t) ** 2) +
-            self.w_speed * ((s[..., 5] - U_des_t) ** 2) +
-            0.03 * (s[..., 4] ** 2) +
-            8.0 * (s[..., 3] ** 2) +
             self.w_u * torch.sum(u * u, dim=-1)
         )
 
-        # 前后轮相位约束：低速鼓励反相，高速弱同相
+        # Yaw 跟踪：强制 r ≈ U * kappa_ref（方向与幅值一致）
+        yaw_track_err = s[..., 4] - s[..., 5] * kappa_ref_t_signed
+        cost = cost + self.w_yaw_track * (yaw_track_err ** 2)
+
+        # 直线速度激励（机会成本），在转弯段弱化
+        speed_shortfall = torch.clamp(torch.tensor(self.U_max, dtype=s.dtype, device=s.device) - s[..., 5], min=0.0)
+        cost = cost + self.w_speed * speed_shortfall * G_straight
+
+        # 稳定性与蟹行抑制（随转弯门控增强）
         df_t = s[..., 6]
         dr_t = s[..., 7]
+        ay_approx = (s[..., 5] ** 2) * torch.abs(kappa_cur_signed)
+        cost = cost + self.w_ay * (ay_approx ** 2) * G_turn
+        cost = cost + self.w_beta * (s[..., 3] ** 2) * (0.5 + 0.5 * G_turn)
+        # 直接抑制同向同角（df+dr）
+        cost = cost + self.w_crab * ((df_t + dr_t) ** 2) * G_turn
+
+        # 前后轮相位约束：低速鼓励反相，高速弱同相
         U_t = s[..., 5]
         s_lin = torch.clamp((U_t - self.U1) / (self.U2 - self.U1), 0.0, 1.0)
-        k_t = self.k_low * (1.0 - s_lin) + self.k_high * s_lin
-        # 低速权重大，高速权重减小
-        w_phase = self.w_phase_base * (1.0 - s_lin) + (0.25 * self.w_phase_base) * s_lin
+        # 相位比例：在大曲率时强反相；在小曲率且高速时允许微弱同相
+        k_t = (-self.k_max * G_turn) + (self.k_high * (1.0 - G_turn) * s_lin)
+        # 弯道提升相位权重
+        w_phase = self.w_phase_base * (1.0 + 2.0 * G_turn)
         phase_err = dr_t - k_t * df_t
         cost = cost + w_phase * (phase_err ** 2)
 
-        # 直接惩罚同相（df*dr>0），在低速更强
+        # 直接惩罚同相（df*dr>0），随转弯增强
         same_sign_pos = torch.clamp(df_t * dr_t, min=0.0)
-        cost = cost + (self.w_phase_sign * (1.0 - s_lin)) * (same_sign_pos ** 2)
+        cost = cost + (self.w_phase_sign * G_turn) * (same_sign_pos ** 2)
 
         # 理想横摆率前馈参考，鼓励 dr 接近 dr_ff
         beta_np = s[..., 3].detach().cpu().numpy()
@@ -267,6 +294,10 @@ class MPPIController4WS:
             dr_ff_list.append(float(dr_ff))
         dr_ff_t = torch.tensor(dr_ff_list, dtype=s.dtype, device=s.device)
         cost = cost + self.w_yaw_ff * ((dr_t - dr_ff_t) ** 2)
+
+        # 弯道加速变化惩罚：抑制弯中激进加速或减速
+        dU_t = u[..., 2]
+        cost = cost + self.w_dU_turn * (dU_t ** 2) * G_turn
 
         # 动作变化惩罚（使用上一时刻）
         if self._last_u is not None:

@@ -7,7 +7,7 @@ vehicle:
   track: 3.0
   kf: 160000.0
   kr: 170000.0
-  U: 1.016908053541556
+  U: 3.3091736194328405
   mu: 0.85
   g: 9.81
   U_min: 0.5
@@ -30,5 +30,5 @@ control:
   mode: 2dof
   track:
     enabled: true
-    retention_sec: 15.0
+    retention_sec: 60.0
     max_points: 20000
