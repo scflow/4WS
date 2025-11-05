@@ -12,7 +12,7 @@ vehicle:
   g: 9.81
   U_min: 0.5
   U_blend: 0.3
-  tire_model: linear
+  tire_model: pacejka
 control:
   dt: 0.02
   k_v: 0.8

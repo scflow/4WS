@@ -116,6 +116,8 @@ class SimEngine:
                     pass
             if self.autop_mode == 'mpc' and self.mode == '2dof':
                 self._autop_update_mpc()
+            elif self.autop_mode == 'mppi' and self.mode == '2dof':
+                self._autop_update_mppi()
             elif self.mode == '2dof':
                 self._autop_update_simple()
 
@@ -370,7 +372,7 @@ class SimEngine:
     def set_autop_mode(self, mode: str):
         with self._lock:
             m = str(mode or '').lower()
-            if m in ('simple', 'mpc'):
+            if m in ('simple', 'mpc', 'mppi'):
                 self.autop_mode = m
             else:
                 # 保底：不识别即保持当前
@@ -540,6 +542,56 @@ class SimEngine:
         self.ctrl.delta_f = float(self._df_filt)
         self.ctrl.delta_r = float(self._dr_filt)
 
+    def _autop_update_mppi(self):
+        """使用 MPPI 基于 Torch 2DOF 动力学进行并行滚动求解首步控制。"""
+        if not (self.autop_enabled and self.mode == '2dof' and len(self.plan) > 0):
+            return
+
+        # 延迟初始化控制器
+        if not hasattr(self, '_mppi_ctrl') or self._mppi_ctrl is None:
+            try:
+                from .mppi_iface import MPPIController4WS
+                self._mppi_ctrl = MPPIController4WS(
+                    params=self.params,
+                    dt=self.dt,
+                    plan_provider=lambda: self.plan,
+                    delta_max=float(self.delta_max),
+                    dU_max=float(self.dU_max),
+                    U_max=float(self.U_max),
+                )
+            except Exception:
+                # 初始化失败则退回 simple 模式
+                self.autop_mode = 'simple'
+                # 初始化失败，保持当前模式以便可诊断问题
+                return
+
+        # 当前状态打包为 s = [x, y, psi, beta, r, U]
+        s_np = np.array([
+            float(self.state2.x),
+            float(self.state2.y),
+            float(self.state2.psi),
+            float(self.state2.beta),
+            float(self.state2.r),
+            float(self.ctrl.U),
+        ], dtype=float)
+
+        # 求解控制动作 u = [delta_f, delta_r, dU]
+        try:
+            u_np = self._mppi_ctrl.command(s_np)
+        except Exception:
+            return
+        df_cmd, dr_cmd, dU_cmd = float(u_np[0]), float(u_np[1]), float(u_np[2])
+        print(f"MPPI: df_cmd={df_cmd:.4f}, dr_cmd={dr_cmd:.4f}, dU_cmd={dU_cmd:.4f}")
+        # 限幅与速度边界
+        df_cmd = float(np.clip(df_cmd, -self.delta_max, self.delta_max))
+        dr_cmd = float(np.clip(dr_cmd, -self.delta_max, self.delta_max))
+        U_next = float(np.clip(self.ctrl.U + dU_cmd, 0.0, self.U_max))
+
+        # 写回控制
+        self.ctrl.delta_f = df_cmd
+        self.ctrl.delta_r = dr_cmd
+        self.ctrl.U = U_next
+
     def _linearize_2dof(self, x_vec: np.ndarray, df0: float, dr0: float) -> tuple[np.ndarray, np.ndarray]:
         """数值线性化 2DOF：xdot ≈ A x + B u，返回 A(2x2), B(2x2)。"""
         base = deriv_2dof(x_vec, df0, dr0, self.params)
@@ -564,48 +616,6 @@ class SimEngine:
             xdot_eps = np.array(deriv_2dof(x_vec, float(u_eps[0]), float(u_eps[1]), self.params)["xdot"], dtype=float)
             B[:, j] = (xdot_eps - xdot0) / eps_u
         return A, B
-
-    # def _autop_update_mpc(self):
-    #     """调用外部模块的 MPC 求解，并加卡尔曼滤波与 PID 平滑以抑制抖动。"""
-    #     if not (self.autop_enabled and self.mode == '2dof' and len(self.plan) > 0):
-    #         return
-
-    #     # 原始状态与控制
-    #     state_raw = {
-    #         'x': float(self.state2.x),
-    #         'y': float(self.state2.y),
-    #         'psi': float(self.state2.psi),
-    #         'beta': float(self.state2.beta),
-    #         'r': float(self.state2.r),
-    #     }
-    #     ctrl_raw = {
-    #         'U': float(self.ctrl.U),
-    #         'delta_f': float(self.ctrl.delta_f),
-    #         'delta_r': float(self.ctrl.delta_r),
-    #     }
-
-    #     # 使用原始状态进行 MPC 求解
-    #     state_for_mpc = state_raw
-
-    #     # 求解 MPC 首步控制
-    #     df_cmd, dr_cmd = solve_mpc_2dof(
-    #         state_for_mpc,
-    #         ctrl_raw,
-    #         self.params,
-    #         self.plan,
-    #         self.dt,
-    #         H=12,
-    #         Q_beta=0.1,
-    #         Q_r=1.0,
-    #         Q_psi=2.0,
-    #         R_df=30.0,
-    #         R_dr=30.0,
-    #         R_delta_df=20.0,
-    #         R_delta_dr=20.0,
-    #         delta_max=self.delta_max,
-    #     )
-    #     self.ctrl.delta_f = float(df_cmd)
-    #     self.ctrl.delta_r = float(dr_cmd)
 
     def _autop_update_mpc(self):
         """调用外部模块的 MPC 求解（使用 4-DOF 运动学-动力学模型）。"""
@@ -690,8 +700,6 @@ class SimEngine:
         # --- 5. 应用控制 ---
         self.ctrl.delta_f = float(df_cmd)
         self.ctrl.delta_r = float(dr_cmd)
-
-    
 
     def set_ctrl(self, **kw):
         with self._lock:
