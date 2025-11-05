@@ -44,6 +44,8 @@ class SimEngine:
         self.phase_auto = False            # 关闭高速同相覆盖，恢复手动后轮转向
         self.k_v = 0.8                     # 纵向速度跟踪增益（减弱牵引对Fy挤占）
         self.tau_ctrl = 0.15               # 控制输入滤波时间常数（s）
+        # MPPI 角速度占比（相对于 delta_max）：提高以加快转角响应，保持幅度不变
+        self.delta_rate_frac = 0.5
         # 可配置的横摆阻尼与饱和控制参数（由后端 API 可更新）
         self.yaw_damp = 220.0              # 横摆阻尼力矩系数
         self.yaw_sat_gain = 3.0            # 横摆率饱和额外阻尼增益
@@ -71,7 +73,7 @@ class SimEngine:
         # 规划与自动跟踪（MPC 占位）：参考轨迹与自动跟踪开关
         self.plan: List[Dict[str, float]] = []  # 每项 {t, x, y, psi}
         self.autop_enabled: bool = False
-        self.autop_mode: Literal['simple', 'mpc'] = 'mpc'
+        self.autop_mode: Literal['simple', 'mpc', 'mppi'] = 'mpc'
         self._plan_idx: int = 0
         # 目标位姿与重规划开关
         self.goal_pose_end: Dict[str, float] | None = None
@@ -558,14 +560,27 @@ class SimEngine:
                     delta_max=float(self.delta_max),
                     dU_max=float(self.dU_max),
                     U_max=float(self.U_max),
+                    delta_rate_frac=float(self.delta_rate_frac),
                 )
             except Exception:
-                # 初始化失败则退回 simple 模式
-                self.autop_mode = 'simple'
-                # 初始化失败，保持当前模式以便可诊断问题
-                return
+                # MPS/CUDA 初始化失败时，回退到 CPU 再试
+                try:
+                    self._mppi_ctrl = MPPIController4WS(
+                        params=self.params,
+                        dt=self.dt,
+                        plan_provider=lambda: self.plan,
+                        delta_max=float(self.delta_max),
+                        dU_max=float(self.dU_max),
+                        U_max=float(self.U_max),
+                        device='cpu',
+                        delta_rate_frac=float(self.delta_rate_frac),
+                    )
+                except Exception:
+                    # CPU 也失败则退回 simple 模式
+                    self.autop_mode = 'simple'
+                    return
 
-        # 当前状态打包为 s = [x, y, psi, beta, r, U]
+        # 当前状态打包为 s = [x, y, psi, beta, r, U, delta_f, delta_r]
         s_np = np.array([
             float(self.state2.x),
             float(self.state2.y),
@@ -573,23 +588,24 @@ class SimEngine:
             float(self.state2.beta),
             float(self.state2.r),
             float(self.ctrl.U),
+            float(self.ctrl.delta_f),
+            float(self.ctrl.delta_r),
         ], dtype=float)
 
-        # 求解控制动作 u = [delta_f, delta_r, dU]
+        # 求解控制动作 u = [d_delta_f, d_delta_r, dU]
         try:
             u_np = self._mppi_ctrl.command(s_np)
         except Exception:
             return
-        df_cmd, dr_cmd, dU_cmd = float(u_np[0]), float(u_np[1]), float(u_np[2])
-        print(f"MPPI: df_cmd={df_cmd:.4f}, dr_cmd={dr_cmd:.4f}, dU_cmd={dU_cmd:.4f}")
-        # 限幅与速度边界
-        df_cmd = float(np.clip(df_cmd, -self.delta_max, self.delta_max))
-        dr_cmd = float(np.clip(dr_cmd, -self.delta_max, self.delta_max))
+        d_df_cmd, d_dr_cmd, dU_cmd = float(u_np[0]), float(u_np[1]), float(u_np[2])
+        # 角度积分与限幅；速度边界
+        df_next = float(np.clip(self.ctrl.delta_f + d_df_cmd, -self.delta_max, self.delta_max))
+        dr_next = float(np.clip(self.ctrl.delta_r + d_dr_cmd, -self.delta_max, self.delta_max))
         U_next = float(np.clip(self.ctrl.U + dU_cmd, 0.0, self.U_max))
 
-        # 写回控制
-        self.ctrl.delta_f = df_cmd
-        self.ctrl.delta_r = dr_cmd
+        # 写回控制（微分 -> 角度）
+        self.ctrl.delta_f = df_next
+        self.ctrl.delta_r = dr_next
         self.ctrl.U = U_next
 
     def _linearize_2dof(self, x_vec: np.ndarray, df0: float, dr0: float) -> tuple[np.ndarray, np.ndarray]:

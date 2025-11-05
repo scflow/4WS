@@ -43,6 +43,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "yaw_sat_gain": 3.0,
         "drive_bias_front": 0.1,
         "drive_bias_rear": 0.9,
+        "delta_rate_frac": 0.8,
         "delta_max": 0.698131700797,  # 40 deg in rad
         "U_switch": 8.0,
         "phase_auto": False,
@@ -116,7 +117,7 @@ def apply_config(cfg: Dict[str, Any], vp: Any, engine: Any) -> None:
 
     # control config applied to engine
     ccfg = cfg.get("control") or {}
-    for k in ("k_v","tau_ctrl","tau_low","tau_beta","yaw_damp","yaw_sat_gain","drive_bias_front","drive_bias_rear","delta_max","U_switch"):
+    for k in ("k_v","tau_ctrl","tau_low","tau_beta","yaw_damp","yaw_sat_gain","drive_bias_front","drive_bias_rear","delta_rate_frac","delta_max","U_switch"):
         if k in ccfg:
             try:
                 setattr(engine, k, float(ccfg[k]))
@@ -176,6 +177,7 @@ def current_config(vp: Any, engine: Any) -> Dict[str, Any]:
         "yaw_sat_gain": float(getattr(engine, "yaw_sat_gain", 3.0)),
         "drive_bias_front": float(getattr(engine, "drive_bias_front", 0.1)),
         "drive_bias_rear": float(getattr(engine, "drive_bias_rear", 0.9)),
+        "delta_rate_frac": float(getattr(engine, "delta_rate_frac", 0.8)),
         "delta_max": float(getattr(engine, "delta_max", 0.698131700797)),
         "U_switch": float(getattr(engine, "U_switch", 8.0)),
         "phase_auto": bool(getattr(engine, "phase_auto", False)),

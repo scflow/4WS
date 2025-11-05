@@ -75,15 +75,17 @@ def lateral_forces_2dof_torch(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """根据选择的轮胎模型计算前/后轮横向力（Torch 版）。
 
-    - 线性模型（推荐用于 MPPI 批量并行）：Fy = k * alpha
+    - 线性模型（推荐用于 MPPI 批量并行）：Fy = -k * alpha（与惯例一致）
     - Pacejka 模型：回退为逐样本 numpy 计算（性能较低），保留一致性选项。
     """
     model_sel = str(getattr(p, 'tire_model', 'linear') or 'linear').lower()
     if model_sel in ('linear', ''):
         kf = torch.tensor(float(p.kf), dtype=alpha_f.dtype, device=alpha_f.device)
         kr = torch.tensor(float(p.kr), dtype=alpha_r.dtype, device=alpha_r.device)
-        Fy_f = kf * alpha_f
-        Fy_r = kr * alpha_r
+        # 方向约定与 Pacejka 保持一致：α>0（车体左向侧偏）产生向右的恢复力
+        # 因此线性模型应为 Fy = -k * alpha（此前为 + 号，属符号错误）
+        Fy_f = -kf * alpha_f
+        Fy_r = -kr * alpha_r
         return Fy_f, Fy_r
 
     # pacejka 回退：逐样本调用现有 numpy 实现（性能较低）

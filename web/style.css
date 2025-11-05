@@ -55,7 +55,11 @@ body {
 .conn-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--muted); box-shadow: 0 0 0 2px rgba(0,0,0,0.15) inset; }
 .conn-dot.ok { background: var(--ok); }
 .conn-dot.bad { background: var(--danger); }
+.conn-dot.accent { background: var(--accent); }
+.conn-dot.muted { background: var(--muted); }
+.conn-dot.inactive { filter: grayscale(0.4); opacity: 0.7; }
 .conn-label { font-size: 12px; color: var(--muted); }
+.conn-label.inactive { color: var(--muted); opacity: 0.9; }
 
 .left-panel { grid-area: left; padding: 14px; border-right: 1px solid var(--border); overflow: auto; }
 .app-grid.collapsed-left .left-panel { display: none; }

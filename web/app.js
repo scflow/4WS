@@ -45,6 +45,33 @@ async function pingBackend() {
   catch { setConnStatus(false); }
 }
 
+// 设备指示器（MPPI 使用的设备：mps/cuda/cpu）；active 表示是否已初始化并在用
+function setDeviceIndicator(dev, active) {
+  const dot = document.getElementById('dev_dot');
+  const label = document.getElementById('dev_label');
+  if (!dot || !label) return;
+  const d = (dev || '').toLowerCase();
+  let cls = 'muted';
+  let text = 'N/A';
+  if (d === 'mps') { cls = 'ok'; text = 'MPS'; }
+  else if (d === 'cuda') { cls = 'accent'; text = 'CUDA'; }
+  else if (d === 'cpu') { cls = 'muted'; text = 'CPU'; }
+  else if (d) { cls = 'bad'; text = d.toUpperCase(); }
+  dot.classList.remove('ok','bad','accent','muted');
+  dot.classList.add(cls);
+  dot.classList.toggle('inactive', !active);
+  label.classList.toggle('inactive', !active);
+  label.textContent = text;
+}
+async function pollAutopDevice() {
+  try {
+    const res = await fetch('/api/autop', { cache: 'no-store' });
+    if (!res.ok) return;
+    const data = await res.json();
+    setDeviceIndicator(data.device || null, !!data.device_active);
+  } catch {}
+}
+
 // 绑定 UI 控件
 function bindUI() {
   // 主题与外观（右上角）
@@ -141,7 +168,21 @@ function bindUI() {
     } catch (e) { console.warn('POST /api/sim/start_pause 失败', e); }
   });
   resetBtn.addEventListener('click', async () => {
-    try { await fetch('/api/sim/reset', { method: 'POST' }); ctrl.running = false; startPauseBtn.textContent = '开始'; } catch (e) {}
+    try {
+      // 1) 关闭自动跟踪并暂停仿真
+      await fetch('/api/autop', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: false }) });
+      await fetch('/api/sim/start_pause', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ running: false }) });
+      // 2) 后端复位（状态、轨迹、运行标志）
+      await fetch('/api/sim/reset', { method: 'POST' });
+      // 3) 归零前后轮角，避免残留角度影响
+      const res = await fetch('/api/control', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ df_deg: 0, dr_deg: 0 }) });
+      ctrl = await res.json();
+      // 4) 同步 UI 与本地状态
+      ctrl.running = false; startPauseBtn.textContent = '开始';
+      arrived = false; arriveTick = 0; arrivalAnim.active = false; arrivalAnim.t0 = 0;
+      pollAutopDevice();
+      draw();
+    } catch (e) { console.warn('重置失败', e); }
   });
 
   // 起始位姿
@@ -173,9 +214,12 @@ function bindUI() {
       if (data && data.mode && autopModeSel) autopModeSel.value = data.mode;
     }).catch(() => {});
   } catch {}
+  // 初始化设备指示器并轮询更新
+  pollAutopDevice();
+  setInterval(pollAutopDevice, 5000);
   if (autopModeSel) {
     autopModeSel.addEventListener('change', async () => {
-      try { await fetch('/api/autop', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode: autopModeSel.value }) }); } catch {}
+      try { await fetch('/api/autop', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode: autopModeSel.value }) }); pollAutopDevice(); } catch {}
     });
   }
   if (planOnlyBtn) {
@@ -206,6 +250,7 @@ function bindUI() {
         await fetch('/api/autop', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: true, start: true, mode }) });
         ctrl.running = true; startPauseBtn.textContent = '暂停';
         view.follow = true; centerOnVehicle();
+        pollAutopDevice();
       } catch (e) { console.warn('启动自动跟踪失败', e); }
     });
   }
@@ -221,6 +266,7 @@ function bindUI() {
       // 4) 同步 UI 状态
       startPauseBtn.textContent = '开始';
       arrived = false; arriveTick = 0; arrivalAnim.active = false; arrivalAnim.t0 = 0;
+      pollAutopDevice();
       draw();
     } catch (e) { console.warn('停止自动跟踪失败', e); }
   });

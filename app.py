@@ -102,7 +102,7 @@ def api_params():
         # 嵌套：control（仿真控制/配置）
         control = data.get('control') or {}
         if isinstance(control, dict):
-            for k in ['k_v', 'tau_ctrl', 'tau_low', 'tau_beta', 'yaw_damp', 'yaw_sat_gain', 'drive_bias_front', 'drive_bias_rear']:
+            for k in ['k_v', 'tau_ctrl', 'tau_low', 'tau_beta', 'yaw_damp', 'yaw_sat_gain', 'drive_bias_front', 'drive_bias_rear', 'delta_rate_frac']:
                 if k in control:
                     try:
                         val = float(control[k])
@@ -122,6 +122,8 @@ def api_params():
                             ENGINE.drive_bias_front = val
                         elif k == 'drive_bias_rear':
                             ENGINE.drive_bias_rear = val
+                        elif k == 'delta_rate_frac':
+                            ENGINE.delta_rate_frac = val
                     except (TypeError, ValueError):
                         pass
 
@@ -241,7 +243,21 @@ def api_start_pause():
 # 仿真重置
 @app.route('/api/sim/reset', methods=['POST'])
 def api_reset():
+    # 重置仿真：同时禁用自动跟踪、清空参考计划，并将前后轮角归零
     ENGINE.reset()
+    try:
+        ENGINE.set_autop(False)
+    except Exception:
+        pass
+    try:
+        # 清空参考轨迹（防止重置后立即继续自动跟踪）
+        ENGINE.load_plan([])
+    except Exception:
+        pass
+    try:
+        ENGINE.set_ctrl(df=0.0, dr=0.0)
+    except Exception:
+        pass
     return jsonify({'ok': True})
 
 # 设置初始位姿
@@ -397,11 +413,40 @@ def api_plan_circle():
 @app.route('/api/autop', methods=['GET', 'POST'])
 def api_autop():
     if request.method == 'GET':
-        return jsonify({'enabled': bool(ENGINE.autop_enabled), 'mode': getattr(ENGINE, 'autop_mode', 'simple'), 'plan_count': len(getattr(ENGINE, 'plan', []) or [])})
+        # 返回自动状态与设备信息：
+        # - device: 设备（若 MPPI 已初始化则为实际使用；否则为按可用性推断）
+        # - device_active: 是否已初始化并正在使用 MPPI
+        dev = None
+        dev_active = False
+        try:
+            ctrl = getattr(ENGINE, '_mppi_ctrl', None)
+            d = getattr(ctrl, 'device', None) if ctrl is not None else None
+            if isinstance(d, str):
+                dev = d
+                dev_active = True
+            if dev is None:
+                try:
+                    import torch  # type: ignore
+                    try:
+                        mps_available = hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()
+                    except Exception:
+                        mps_available = False
+                    dev = 'mps' if mps_available else ('cuda' if torch.cuda.is_available() else 'cpu')
+                except Exception:
+                    dev = 'cpu'
+        except Exception:
+            if dev is None:
+                dev = 'cpu'
+        return jsonify({
+            'enabled': bool(ENGINE.autop_enabled),
+            'mode': getattr(ENGINE, 'autop_mode', 'simple'),
+            'plan_count': len(getattr(ENGINE, 'plan', []) or []),
+            'device': dev,
+            'device_active': dev_active,
+        })
     data = request.get_json(force=True) or {}
     enabled = bool(data.get('enabled', True))
     ENGINE.set_autop(enabled)
-    # 可选：切换模式（'simple' 或 'mpc'）
     mode = data.get('mode')
     if isinstance(mode, str):
         try:
@@ -411,7 +456,29 @@ def api_autop():
     # 可选：启动仿真
     if bool(data.get('start', False)):
         ENGINE.start()
-    return jsonify({'enabled': bool(ENGINE.autop_enabled), 'mode': getattr(ENGINE, 'autop_mode', 'simple')})
+    # 返回设备与启用状态（同 GET）
+    dev = None
+    dev_active = False
+    try:
+        ctrl = getattr(ENGINE, '_mppi_ctrl', None)
+        d = getattr(ctrl, 'device', None) if ctrl is not None else None
+        if isinstance(d, str):
+            dev = d
+            dev_active = True
+        if dev is None:
+            try:
+                import torch  # type: ignore
+                try:
+                    mps_available = hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()
+                except Exception:
+                    mps_available = False
+                dev = 'mps' if mps_available else ('cuda' if torch.cuda.is_available() else 'cpu')
+            except Exception:
+                dev = 'cpu'
+    except Exception:
+        if dev is None:
+            dev = 'cpu'
+    return jsonify({'enabled': bool(ENGINE.autop_enabled), 'mode': getattr(ENGINE, 'autop_mode', 'simple'), 'device': dev, 'device_active': dev_active})
 
 # 仿真模式：2DOF / 3DOF
 @app.route('/api/mode', methods=['GET', 'POST'])

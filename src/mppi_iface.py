@@ -5,14 +5,15 @@ from typing import Callable, List, Dict, Optional
 from .params import VehicleParams
 from .twodof_torch import slip_angles_2dof_torch, lateral_forces_2dof_torch
 from .pytorch_mppi.mppi import MPPI
+from .strategy import ideal_yaw_rate
 
 
 class MPPIController4WS:
     """4WS 车辆的 MPPI 控制封装。
 
     - 动力学：复用 twodof 的物理公式（Torch 版），在 MPPI 内进行批量滚动。
-    - 状态：s = [x, y, psi, beta, r, U]
-    - 动作：u = [delta_f, delta_r, dU]
+    - 状态：s = [x, y, psi, beta, r, U, delta_f, delta_r]
+    - 动作：u = [d_delta_f, d_delta_r, dU]（转角与速度均使用微分形式）
     """
 
     def __init__(
@@ -24,9 +25,10 @@ class MPPIController4WS:
         dU_max: float,
         U_max: float,
         device: Optional[str] = None,
-        num_samples: int = 1000,
-        horizon: int = 14,
-        lambda_: float = 180.0,
+        num_samples: int = 16,
+        horizon: int = 20,
+        lambda_: float = 120.0,
+        delta_rate_frac: float = 0.5,
     ):
         self.params = params
         self.dt = float(dt)
@@ -34,36 +36,58 @@ class MPPIController4WS:
         self.delta_max = float(delta_max)
         self.dU_max = float(dU_max)
         self.U_max = float(U_max)
-        self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
+        # 每秒角度变化上限占比（相对于 delta_max），默认 0.5 更保守
+        # 可调以加快转角速度，但不改变最终角度幅度上限
+        self.delta_rate_frac = float(delta_rate_frac)
+        # prefer MPS on macOS if available, else CUDA, else CPU
+        try:
+            mps_available = hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()
+        except Exception:
+            mps_available = False
+        self.device = device or ('mps' if mps_available else ('cuda' if torch.cuda.is_available() else 'cpu'))
 
-        self.w_lat = 100.0
-        self.w_head = 600.0
-        self.w_speed = 4.0
+        self.w_lat = 2000.0
+        self.w_head = 4000.0
+        self.w_speed = 20.0
         self.w_u = 1.0
-        self.w_du = 0.4
+        self.w_du = 2.0
+        # 速度相关的相位约束（低速更强反相，高速弱同相）
+        self.w_phase_base = 300.0
+        self.k_low = -0.30
+        self.k_high = 0.10
+        self.U1 = 5.0
+        self.U2 = 20.0
+        # 额外约束：直接惩罚同相（df、dr 同号）与加入理想横摆率前馈
+        self.w_phase_sign = 120.0
+        self.w_yaw_ff = 80.0
 
-        # 控制噪声协方差（三维动作）
+        # 控制噪声协方差（三维动作，使用微分形式）
         noise_sigma = torch.diag(torch.tensor([
-            0.08,  # delta_f
-            0.08,  # delta_r
-            0.5    # dU
+            0.03,  # d_delta_f 每步角度增量
+            0.03,  # d_delta_r 每步角度增量
+            0.15   # dU 速度增量
         ], dtype=torch.float32))
 
-        # 动作边界
+        # 动作边界（微分形式：转角增量限制为每秒上限的 dt 倍）
+        # 角速度上限：delta_rate_frac * delta_max / s（可由外部配置传入）
+        # 例如：delta_rate_frac=0.8 表示 1 秒可接近 0.8*delta_max 的角度变化
+        delta_rate_max = float(self.delta_rate_frac) * self.delta_max  # rad/s
+        d_delta_bound = delta_rate_max * self.dt
         u_min = torch.tensor([
-            -self.delta_max,
-            -self.delta_max,
+            -d_delta_bound,
+            -d_delta_bound,
             -self.dU_max * self.dt
         ], dtype=torch.float32)
         u_max = torch.tensor([
-            self.delta_max,
-            self.delta_max,
+            d_delta_bound,
+            d_delta_bound,
             self.dU_max * self.dt
         ], dtype=torch.float32)
 
         self.mppi = MPPI(
             dynamics=self._dynamics,
             running_cost=self._running_cost,
+            nx=8,  # 状态维度: [x, y, psi, beta, r, U, delta_f, delta_r]
             noise_sigma=noise_sigma,
             num_samples=num_samples,
             horizon=horizon,
@@ -85,14 +109,25 @@ class MPPIController4WS:
         if u.ndim == 1:
             u = u.unsqueeze(0)
 
-        x, y, psi, beta, r, U = s.unbind(-1)
-        df, dr, dU = u.unbind(-1)
+        # 解包状态（支持 6/8 维；默认无转角时从 0 起始）
+        if s.shape[-1] >= 8:
+            x, y, psi, beta, r, U, df_cur, dr_cur = s.unbind(-1)
+        else:
+            x, y, psi, beta, r, U = s.unbind(-1)
+            df_cur = torch.zeros_like(U)
+            dr_cur = torch.zeros_like(U)
+
+        # 解包动作：转角增量与速度增量
+        d_df, d_dr, dU = u.unbind(-1)
 
         # 速度更新（带边界）
         U_next = torch.clamp(U + dU, 0.0, torch.tensor(self.U_max, dtype=s.dtype, device=s.device))
+        # 角度更新（限幅）
+        df_next = torch.clamp(df_cur + d_df, -self.delta_max, self.delta_max)
+        dr_next = torch.clamp(dr_cur + d_dr, -self.delta_max, self.delta_max)
 
         # 侧偏角与横向力（复用 twodof 公式，但 U 使用当前状态值）
-        alpha_f, alpha_r = slip_angles_2dof_torch(beta, r, df, dr, float(self.params.a), float(self.params.b), U_next)
+        alpha_f, alpha_r = slip_angles_2dof_torch(beta, r, df_next, dr_next, float(self.params.a), float(self.params.b), U_next)
         Fy_f, Fy_r = lateral_forces_2dof_torch(alpha_f, alpha_r, self.params)
 
         # 2DOF 动力学方程
@@ -113,6 +148,8 @@ class MPPIController4WS:
             beta + self.dt * beta_dot,
             r + self.dt * r_dot,
             U_next,
+            df_next,
+            dr_next,
         ], dim=-1)
 
         return s_next.squeeze(0)
@@ -191,16 +228,45 @@ class MPPIController4WS:
         kappa_cur = torch.abs(s[..., 4] / torch.clamp(s[..., 5], min=1e-6))
         kappa_ref_t = torch.tensor(np.abs(kappa_ref_list), dtype=s.dtype, device=s.device)
 
-        # 代价项
+        # 代价项（提高曲率跟踪权重、减小横摆率惩罚）
         cost = (
             self.w_lat * (e_y_t ** 2) +
             self.w_head * (e_psi_t ** 2) +
-            12.0 * ((kappa_cur - kappa_ref_t) ** 2) +
+            24.0 * ((kappa_cur - kappa_ref_t) ** 2) +
             self.w_speed * ((s[..., 5] - U_des_t) ** 2) +
-            0.15 * (s[..., 4] ** 2) +
+            0.03 * (s[..., 4] ** 2) +
             8.0 * (s[..., 3] ** 2) +
             self.w_u * torch.sum(u * u, dim=-1)
         )
+
+        # 前后轮相位约束：低速鼓励反相，高速弱同相
+        df_t = s[..., 6]
+        dr_t = s[..., 7]
+        U_t = s[..., 5]
+        s_lin = torch.clamp((U_t - self.U1) / (self.U2 - self.U1), 0.0, 1.0)
+        k_t = self.k_low * (1.0 - s_lin) + self.k_high * s_lin
+        # 低速权重大，高速权重减小
+        w_phase = self.w_phase_base * (1.0 - s_lin) + (0.25 * self.w_phase_base) * s_lin
+        phase_err = dr_t - k_t * df_t
+        cost = cost + w_phase * (phase_err ** 2)
+
+        # 直接惩罚同相（df*dr>0），在低速更强
+        same_sign_pos = torch.clamp(df_t * dr_t, min=0.0)
+        cost = cost + (self.w_phase_sign * (1.0 - s_lin)) * (same_sign_pos ** 2)
+
+        # 理想横摆率前馈参考，鼓励 dr 接近 dr_ff
+        beta_np = s[..., 3].detach().cpu().numpy()
+        r_np = s[..., 4].detach().cpu().numpy()
+        df_np = s[..., 6].detach().cpu().numpy()
+        dr_ff_list = []
+        for i in range(df_np.shape[0]):
+            try:
+                dr_ff, _ = ideal_yaw_rate(float(df_np[i]), np.array([beta_np[i], r_np[i]], dtype=float), self.params)
+            except Exception:
+                dr_ff = 0.0
+            dr_ff_list.append(float(dr_ff))
+        dr_ff_t = torch.tensor(dr_ff_list, dtype=s.dtype, device=s.device)
+        cost = cost + self.w_yaw_ff * ((dr_t - dr_ff_t) ** 2)
 
         # 动作变化惩罚（使用上一时刻）
         if self._last_u is not None:
