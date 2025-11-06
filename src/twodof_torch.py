@@ -88,30 +88,18 @@ def lateral_forces_2dof_torch(
         Fy_r = -kr * alpha_r
         return Fy_f, Fy_r
 
-    # pacejka 回退：逐样本调用现有 numpy 实现（性能较低）
-    from .tire import PacejkaParams, lateral_force_dispatch
-    Fzf_t, Fzr_t = static_loads_2dof_torch(float(p.a), float(p.b), float(p.m), float(p.g), device=alpha_f.device, dtype=alpha_f.dtype)
+    # 使用 Torch 版 Pacejka，实现张量广播与梯度可用
+    from .tire_torch import lateral_force_dispatch_torch
+    from .tire import PacejkaParams
+    Fzf_t, Fzr_t = static_loads_2dof_torch(
+        float(p.a), float(p.b), float(p.m), float(p.g),
+        device=alpha_f.device, dtype=alpha_f.dtype,
+    )
     tp_f = PacejkaParams(mu_y=float(p.mu))
     tp_r = PacejkaParams(mu_y=float(p.mu))
 
-    af_np = torch.atleast_1d(alpha_f).detach().cpu().numpy()
-    ar_np = torch.atleast_1d(alpha_r).detach().cpu().numpy()
-    Fzf_val = float(Fzf_t.detach().cpu().numpy())
-    Fzr_val = float(Fzr_t.detach().cpu().numpy())
-
-    Fy_f_list = []
-    Fy_r_list = []
-    for i in range(af_np.shape[0]):
-        Fy_f_list.append(float(lateral_force_dispatch(float(af_np[i]), Fzf_val, model_sel, float(p.kf), tp_f)))
-        Fy_r_list.append(float(lateral_force_dispatch(float(ar_np[i]), Fzr_val, model_sel, float(p.kr), tp_r)))
-
-    Fy_f = torch.tensor(Fy_f_list, dtype=alpha_f.dtype, device=alpha_f.device)
-    Fy_r = torch.tensor(Fy_r_list, dtype=alpha_r.dtype, device=alpha_r.device)
-    # 若输入是标量，则压缩为标量张量
-    if alpha_f.ndim == 0:
-        Fy_f = Fy_f.squeeze(0)
-    if alpha_r.ndim == 0:
-        Fy_r = Fy_r.squeeze(0)
+    Fy_f = lateral_force_dispatch_torch(alpha_f, Fzf_t, model_sel, float(p.kf), tp_f)
+    Fy_r = lateral_force_dispatch_torch(alpha_r, Fzr_t, model_sel, float(p.kr), tp_r)
     return Fy_f, Fy_r
 
 

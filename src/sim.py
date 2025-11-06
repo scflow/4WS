@@ -118,7 +118,7 @@ class SimEngine:
                     pass
             if self.autop_mode == 'mpc' and self.mode == '2dof':
                 self._autop_update_mpc()
-            elif self.autop_mode == 'mppi' and self.mode == '2dof':
+            elif self.autop_mode == 'mppi':
                 self._autop_update_mppi()
             elif self.mode == '2dof':
                 self._autop_update_simple()
@@ -545,8 +545,8 @@ class SimEngine:
         self.ctrl.delta_r = float(self._dr_filt)
 
     def _autop_update_mppi(self):
-        """使用 MPPI 基于 Torch 2DOF 动力学进行并行滚动求解首步控制。"""
-        if not (self.autop_enabled and self.mode == '2dof' and len(self.plan) > 0):
+        """使用 MPPI（2DOF 或 3DOF）进行并行滚动首步控制求解。"""
+        if not (self.autop_enabled and len(self.plan) > 0):
             return
 
         # 延迟初始化控制器
@@ -560,6 +560,7 @@ class SimEngine:
                     delta_max=float(self.delta_max),
                     dU_max=float(self.dU_max),
                     U_max=float(self.U_max),
+                    model_type=('3dof' if self.mode == '3dof' else '2dof'),
                     delta_rate_frac=float(self.delta_rate_frac),
                 )
             except Exception:
@@ -573,24 +574,52 @@ class SimEngine:
                         dU_max=float(self.dU_max),
                         U_max=float(self.U_max),
                         device='cpu',
+                        model_type=('3dof' if self.mode == '3dof' else '2dof'),
                         delta_rate_frac=float(self.delta_rate_frac),
                     )
-                except Exception:
+                except Exception as e:
+                    print(f"[SimEngine] MPPI 异常原因: {e}")
                     # CPU 也失败则退回 simple 模式
                     self.autop_mode = 'simple'
                     return
+            # 传递牵引分配与速度控制增益到控制器（3DOF 使用）
+            try:
+                self._mppi_ctrl.drive_bias_front = float(self.drive_bias_front)
+                self._mppi_ctrl.drive_bias_rear = float(self.drive_bias_rear)
+                self._mppi_ctrl.k_v = float(self.k_v)
+            except Exception:
+                pass
 
-        # 当前状态打包为 s = [x, y, psi, beta, r, U, delta_f, delta_r]
-        s_np = np.array([
-            float(self.state2.x),
-            float(self.state2.y),
-            float(self.state2.psi),
-            float(self.state2.beta),
-            float(self.state2.r),
-            float(self.ctrl.U),
-            float(self.ctrl.delta_f),
-            float(self.ctrl.delta_r),
-        ], dtype=float)
+        # 当前状态按模式打包为 s
+        if self.mode == '2dof':
+            # s = [x, y, psi, beta, r, U, df, dr]
+            s_np = np.array([
+                float(self.state2.x),
+                float(self.state2.y),
+                float(self.state2.psi),
+                float(self.state2.beta),
+                float(self.state2.r),
+                float(self.ctrl.U),
+                float(self.ctrl.delta_f),
+                float(self.ctrl.delta_r),
+            ], dtype=float)
+        else:
+            # s = [vx, vy, r, x, y, psi, U_cmd, df, dr]
+            # 使用当前 3DOF 速度与位置；U_cmd 采用控制模块中的速度指令
+            # 若尚未进入 3DOF 状态，可做保守初始化
+            vx = float(getattr(self.state3, 'vx', self.params.U_eff()))
+            vy = float(getattr(self.state3, 'vy', 0.0))
+            s_np = np.array([
+                vx,
+                vy,
+                float(getattr(self.state3, 'r', self.state2.r)),
+                float(getattr(self.state3, 'x', self.state2.x)),
+                float(getattr(self.state3, 'y', self.state2.y)),
+                float(getattr(self.state3, 'psi', self.state2.psi)),
+                float(self.ctrl.U),
+                float(self.ctrl.delta_f),
+                float(self.ctrl.delta_r),
+            ], dtype=float)
 
         # 求解控制动作 u = [d_delta_f, d_delta_r, dU]
         try:
@@ -598,12 +627,12 @@ class SimEngine:
         except Exception:
             return
         d_df_cmd, d_dr_cmd, dU_cmd = float(u_np[0]), float(u_np[1]), float(u_np[2])
-        # 角度积分与限幅；速度边界
+        # 角度积分与限幅；速度边界（2DOF: 实际速度；3DOF: 速度指令）
         df_next = float(np.clip(self.ctrl.delta_f + d_df_cmd, -self.delta_max, self.delta_max))
         dr_next = float(np.clip(self.ctrl.delta_r + d_dr_cmd, -self.delta_max, self.delta_max))
         U_next = float(np.clip(self.ctrl.U + dU_cmd, 0.0, self.U_max))
 
-        # 写回控制（微分 -> 角度）
+        # 写回控制（微分 -> 角度）；U 为速度或速度指令
         self.ctrl.delta_f = df_next
         self.ctrl.delta_r = dr_next
         self.ctrl.U = U_next

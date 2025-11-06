@@ -10,8 +10,12 @@
   <div class="app-grid">
     <header class="app-header">
       <h1>四轮转向 (4WS) 可视化仿真</h1>
-      <p class="subtitle">2/3-DOF 模型 · 交互式地图</p>
       <div class="header-actions">
+        <div class="global-plot-controls">
+          <button id="global_pause" class="btn small">开始记录</button>
+          <button id="global_clear" class="btn small">清空</button>
+          <button id="global_export" class="btn small">导出CSV</button>
+        </div>
         <div class="theme-controls">
           <label for="theme_select">主题</label>
           <select id="theme_select">
@@ -27,13 +31,13 @@
             <input type="color" id="ok_color" value="#4caf50" />
           </div>
         </div>
-        <button id="toggle_left_panel" class="btn">折叠参数栏</button>
         <div class="conn-indicator"><span id="conn_dot" class="conn-dot"></span><span class="conn-label">Flask</span></div>
         <div class="conn-indicator"><span id="dev_dot" class="conn-dot"></span><span id="dev_label" class="conn-label">N/A</span></div>
       </div>
     </header>
 
     <aside class="left-panel">
+      <button id="collapse_left_icon" class="side-toggle left" title="折叠/展开左栏">☰</button>
       <section class="panel">
         <h2>起始位姿</h2>
         <div class="control-row">
@@ -91,7 +95,7 @@
         <div class="control-row">
           <button id="plan_only" class="btn ok">规划</button>
           <button id="autop_start" class="btn ok">开始自动跟踪</button>
-          <button id="autop_stop" class="btn danger">停止自动跟踪</button>
+          <button id="export_plan" class="btn">导出规划 CSV</button>
         </div>
       </section>
 
@@ -135,7 +139,6 @@
           <button id="reset_btn" class="btn danger">重置</button>
         </div>
 
-        <p class="hint small">键盘控制：W/S 车速，A/D 前轮，Q/E 后轮</p>
 
         <div class="stats">
           <div><span>X:</span> <strong id="stat_x">0.0</strong> m</div>
@@ -207,10 +210,14 @@
           <button id="telemetry_stop" class="btn danger">停止记录</button>
           <button id="export_telemetry" class="btn">导出遥测 CSV</button>
         </div>
-        <p class="hint small">记录字段：u、x、y、ψ、δf、δr、β̇、ṙ</p>
       </section>
 
+      <section class="panel">
+        <h2>帮助</h2>
+        <p class="hint small">键盘控制：W/S 车速，A/D 前轮，Q/E 后轮</p>
+      </section>
       
+    
     </aside>
 
     <main class="right-panel">
@@ -226,8 +233,39 @@
         <p class="hint">滚轮缩放，拖拽平移；重置视图恢复默认</p>
       </div>
     </main>
+    <aside class="plots-panel-col">
+      <button id="collapse_plots_icon" class="side-toggle right" title="折叠/展开右栏">☰</button>
+      <section class="panel plot-card">
+        <h3 class="sub">航向角误差 eψ (deg)</h3>
+        <canvas id="chart_epsi"></canvas>
+      </section>
+      <section class="panel plot-card">
+        <h3 class="sub">横向误差 ey (m)</h3>
+        <canvas id="chart_ey"></canvas>
+      </section>
+      <section class="panel plot-card">
+        <h3 class="sub">前后轮转角 δf & δr (deg) <span class="legend-inline"><span class="legend-dot df"></span> δf <span class="legend-dot dr"></span> δr</span></h3>
+        <canvas id="chart_df"></canvas>
+      </section>
+      <section class="panel plot-card">
+        <h3 class="sub">质心侧偏角 β (deg)</h3>
+        <canvas id="chart_beta"></canvas>
+      </section>
+      <section class="panel plot-card">
+        <h3 class="sub">车速 U (m/s)</h3>
+        <canvas id="chart_u"></canvas>
+      </section>
+    </aside>
   </div>
-
+  <!-- Chart.js (local-first, CDN fallback) -->
+  <script src="/lib/chart.umd.min.js"></script>
+  <script>
+    if (!window.Chart) {
+      var s = document.createElement('script');
+      s.src = 'https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js';
+      document.head.appendChild(s);
+    }
+  </script>
   <script src="app.js"></script>
 </body>
 </html>

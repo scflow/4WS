@@ -28,6 +28,139 @@ const canvas = document.getElementById('mapCanvas');
 const ctx = canvas.getContext('2d');
 let view = { scale: 20, offsetX: 0, offsetY: 0, follow: true, showGrid: true };
 
+// 绘图（Chart.js）：最右侧独立栏，每个变量一个图
+let charts = { epsi: null, ey: null, df: null, dr: null, beta: null, u: null };
+let plotsCfg = { keepSec: 60, maxPoints: 600 }; // 10Hz 下约 60s
+let plotsStartMs = performance.now();
+
+function makeLineChart(elId, label, color) {
+  const el = document.getElementById(elId);
+  if (!el || typeof Chart === 'undefined') return null;
+  // 固定像素尺寸，避免随容器宽度自动拉伸
+  try { el.width = 320; el.height = 180; } catch (e) {}
+  const textColor = getCSSVar('--text') || '#e7eaf6';
+  return new Chart(el, {
+    type: 'line',
+    data: { labels: [], datasets: [{ label, data: [], borderColor: color, tension: 0.2, pointRadius: 0 }] },
+    options: {
+      responsive: false,
+      maintainAspectRatio: false,
+      animation: false,
+      plugins: { legend: { display: false }, tooltip: { mode: 'nearest', intersect: false } },
+      scales: {
+        x: { ticks: { color: textColor }, title: { display: true, text: 't (s)', color: textColor } },
+        y: { ticks: { color: textColor }, title: { display: true, text: label, color: textColor } },
+      },
+    },
+  });
+}
+
+function makeDualLineChart(elId, labels, colors) {
+  const el = document.getElementById(elId);
+  if (!el || typeof Chart === 'undefined') return null;
+  try { el.width = 320; el.height = 180; } catch (e) {}
+  const textColor = getCSSVar('--text') || '#e7eaf6';
+  return new Chart(el, {
+    type: 'line',
+    data: {
+      labels: [],
+      datasets: [
+        { label: labels[0], data: [], borderColor: colors[0], tension: 0.2, pointRadius: 0 },
+        { label: labels[1], data: [], borderColor: colors[1], tension: 0.2, pointRadius: 0 },
+      ],
+    },
+    options: {
+      responsive: false,
+      maintainAspectRatio: false,
+      animation: false,
+      plugins: { legend: { display: false }, tooltip: { mode: 'nearest', intersect: false } },
+      scales: {
+        x: { ticks: { color: textColor }, title: { display: true, text: 't (s)', color: textColor } },
+        y: { ticks: { color: textColor }, title: { display: true, text: 'δ (deg)', color: textColor } },
+      },
+    },
+  });
+}
+
+function setupPlots() {
+  try {
+    const accent = getCSSVar('--accent') || '#6aa0ff';
+    const ok = getCSSVar('--ok') || '#4caf50';
+    const muted = getCSSVar('--muted') || '#9aa3bf';
+    const danger = getCSSVar('--danger') || '#e74c3c';
+    charts.epsi = makeLineChart('chart_epsi', 'eψ (deg)', danger);
+    charts.ey   = makeLineChart('chart_ey',   'ey (m)',   muted);
+    charts.df   = makeDualLineChart('chart_df', ['δf (deg)','δr (deg)'], [accent, '#ffa500']);
+    charts.beta = makeLineChart('chart_beta', 'β (deg)',  ok);
+    charts.u    = makeLineChart('chart_u',    'U (m/s)',  accent);
+    bindPlotControls();
+  } catch (e) { /* ignore */ }
+}
+
+function updatePlots() {
+  const t_ms = performance.now() - plotsStartMs;
+  const t_s = Math.max(0, t_ms / 1000);
+  const err = computePlanError();
+  const epsi_deg = deg(err.e_psi || 0);
+  const ey_m = (err.e_y || 0);
+  const df_deg = deg((typeof state.df === 'number') ? state.df : (ctrl.df || 0));
+  const dr_deg = deg((typeof state.dr === 'number') ? state.dr : (ctrl.dr || 0));
+  const beta_deg = deg((typeof state.beta === 'number') ? state.beta : 0);
+  const U_mps = (typeof state.U === 'number') ? state.U : (typeof ctrl.U === 'number' ? ctrl.U : (params.U || 0));
+  const keepN = Math.max(10, Math.min(plotsCfg.maxPoints, Math.floor(plotsCfg.keepSec * 10)));
+  function pushUpdate(key, chart, val) {
+    if (!chart) return;
+    if (plotPaused[key]) return;
+    chart.data.labels.push(t_s.toFixed(1));
+    chart.data.datasets[0].data.push(val);
+    while (chart.data.labels.length > keepN) chart.data.labels.shift();
+    while (chart.data.datasets[0].data.length > keepN) chart.data.datasets[0].data.shift();
+    chart.update('none');
+  }
+  function pushUpdateDual(key, chart, v0, v1) {
+    if (!chart) return;
+    if (plotPaused[key]) return;
+    chart.data.labels.push(t_s.toFixed(1));
+    chart.data.datasets[0].data.push(v0);
+    chart.data.datasets[1].data.push(v1);
+    while (chart.data.labels.length > keepN) chart.data.labels.shift();
+    while (chart.data.datasets[0].data.length > keepN) chart.data.datasets[0].data.shift();
+    while (chart.data.datasets[1].data.length > keepN) chart.data.datasets[1].data.shift();
+    chart.update('none');
+  }
+  pushUpdate('epsi', charts.epsi, epsi_deg);
+  pushUpdate('ey',   charts.ey,   ey_m);
+  pushUpdateDual('df', charts.df, df_deg, dr_deg);
+  pushUpdate('beta', charts.beta, beta_deg);
+  pushUpdate('u',    charts.u,    U_mps);
+}
+
+function computePlanError() {
+  try {
+    if (!Array.isArray(plan) || plan.length < 2) return { e_y: 0, e_psi: 0, ok: false };
+    let best_i = 0, best_d2 = Infinity;
+    for (let i = 0; i < plan.length; i++) {
+      const px = Number(plan[i].x) || 0;
+      const py = Number(plan[i].y) || 0;
+      const dx = px - (Number(state.x) || 0);
+      const dy = py - (Number(state.y) || 0);
+      const d2 = dx*dx + dy*dy;
+      if (d2 < best_d2) { best_d2 = d2; best_i = i; }
+    }
+    const i_seg = Math.max(0, Math.min(plan.length - 2, best_i));
+    const p0 = plan[i_seg]; const p1 = plan[i_seg + 1];
+    const dx = Number(p1.x) - Number(p0.x);
+    const dy = Number(p1.y) - Number(p0.y);
+    const ds = Math.hypot(dx, dy);
+    const psi_ref = ds > 1e-6 ? Math.atan2(dy, dx) : (Number(p0.psi) || Number(state.psi) || 0);
+    const ex = (Number(state.x) || 0) - Number(p0.x);
+    const ey = (Number(state.y) || 0) - Number(p0.y);
+    const e_y = -ex * Math.sin(psi_ref) + ey * Math.cos(psi_ref);
+    const e_psi = angleDiff(psi_ref, Number(state.psi) || 0);
+    return { e_y, e_psi, ok: true };
+  } catch (e) { return { e_y: 0, e_psi: 0, ok: false }; }
+}
+
 // CSS 变量读取
 function getCSSVar(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
 
@@ -79,19 +212,29 @@ function bindUI() {
   const customThemeRow = document.getElementById('custom_theme');
   const accentPicker = document.getElementById('accent_color');
   const okPicker = document.getElementById('ok_color');
-  // 左侧参数栏折叠/展开
+  // 左/右侧栏折叠/展开（图标）
   const gridEl = document.querySelector('.app-grid');
-  const toggleLeftBtn = document.getElementById('toggle_left_panel');
+  const collapseLeftIcon = document.getElementById('collapse_left_icon');
+  const collapsePlotsIcon = document.getElementById('collapse_plots_icon');
   try {
-    const saved = localStorage.getItem('leftCollapsed');
-    if (saved === '1') { gridEl && gridEl.classList.add('collapsed-left'); if (toggleLeftBtn) toggleLeftBtn.textContent = '展开参数栏'; }
+    const leftSaved = localStorage.getItem('leftCollapsed');
+    const plotsSaved = localStorage.getItem('plotsCollapsed');
+    if (leftSaved === '1') { gridEl && gridEl.classList.add('collapsed-left'); }
+    if (plotsSaved === '1') { gridEl && gridEl.classList.add('collapsed-plots'); }
   } catch {}
-  if (toggleLeftBtn) {
-    toggleLeftBtn.addEventListener('click', () => {
+  if (collapseLeftIcon) {
+    collapseLeftIcon.addEventListener('click', () => {
       if (!gridEl) return;
       const collapsed = gridEl.classList.toggle('collapsed-left');
       try { localStorage.setItem('leftCollapsed', collapsed ? '1' : '0'); } catch {}
-      toggleLeftBtn.textContent = collapsed ? '展开参数栏' : '折叠参数栏';
+      draw();
+    });
+  }
+  if (collapsePlotsIcon) {
+    collapsePlotsIcon.addEventListener('click', () => {
+      if (!gridEl) return;
+      const collapsed = gridEl.classList.toggle('collapsed-plots');
+      try { localStorage.setItem('plotsCollapsed', collapsed ? '1' : '0'); } catch {}
       draw();
     });
   }
@@ -134,6 +277,9 @@ function bindUI() {
   okPicker.value = savedOk || '#4caf50';
   applyTheme(savedTheme);
   themeSel.addEventListener('change', () => { applyTheme(themeSel.value); });
+
+  // 顶部全局图表控件
+  bindGlobalPlotControls();
 
   // 模式与场景切换
   const modeSel = document.getElementById('mode_select');
@@ -180,6 +326,26 @@ function bindUI() {
       // 4) 同步 UI 与本地状态
       ctrl.running = false; startPauseBtn.textContent = '开始';
       arrived = false; arriveTick = 0; arrivalAnim.active = false; arrivalAnim.t0 = 0;
+      // 停止遥测采样
+      try { stopTelemetry(); } catch {}
+      // 清空并暂停所有图表记录，重置时间轴
+      try {
+        for (const k of Object.keys(charts)) clearChart(k);
+        plotsStartMs = performance.now();
+        globalPaused = true;
+        for (const k of Object.keys(plotPaused)) {
+          plotPaused[k] = true;
+          const pbtn = document.getElementById(`pause_${k}`);
+          if (pbtn) pbtn.textContent = '开始记录';
+        }
+        const gPauseBtn = document.getElementById('global_pause');
+        if (gPauseBtn) gPauseBtn.textContent = '开始记录';
+      } catch {}
+      // 同步自动跟踪按钮文案
+      try {
+        const autopStartEl = document.getElementById('autop_start');
+        if (autopStartEl) autopStartEl.textContent = '开始自动跟踪';
+      } catch {}
       pollAutopDevice();
       draw();
     } catch (e) { console.warn('重置失败', e); }
@@ -207,11 +373,12 @@ function bindUI() {
   const planMethodSel = document.getElementById('plan_method_select');
   // 规划时长 T 已移除，由后端自动估算
   const autopModeSel = document.getElementById('autop_mode_select');
-  const autopStopBtn = document.getElementById('autop_stop');
+  const exportPlanBtn = document.getElementById('export_plan');
   // 初始化自动模式选择器与后端同步
   try {
     fetch('/api/autop', { cache: 'no-store' }).then(res => res.ok ? res.json() : null).then(data => {
       if (data && data.mode && autopModeSel) autopModeSel.value = data.mode;
+      if (autopStartBtn) autopStartBtn.textContent = (data && data.enabled) ? '停止自动跟踪' : '开始自动跟踪';
     }).catch(() => {});
   } catch {}
   // 初始化设备指示器并轮询更新
@@ -246,30 +413,52 @@ function bindUI() {
   if (autopStartBtn) {
     autopStartBtn.addEventListener('click', async () => {
       try {
-        const mode = (autopModeSel && autopModeSel.value) || 'mpc';
-        await fetch('/api/autop', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: true, start: true, mode }) });
-        ctrl.running = true; startPauseBtn.textContent = '暂停';
-        view.follow = true; centerOnVehicle();
-        pollAutopDevice();
-      } catch (e) { console.warn('启动自动跟踪失败', e); }
+        // 读取当前自动状态以决定切换方向
+        let enabled = false;
+        try {
+          const res = await fetch('/api/autop', { cache: 'no-store' });
+          if (res.ok) {
+            const info = await res.json(); enabled = !!info.enabled;
+          }
+        } catch {}
+        if (enabled) {
+          // 当前已启用：执行停止逻辑
+          await fetch('/api/autop', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: false }) });
+          await fetch('/api/sim/start_pause', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ running: false }) });
+          const res2 = await fetch('/api/control', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ df_deg: 0, dr_deg: 0 }) });
+          ctrl = await res2.json();
+          startPauseBtn.textContent = '开始';
+          autopStartBtn.textContent = '开始自动跟踪';
+          arrived = false; arriveTick = 0; arrivalAnim.active = false; arrivalAnim.t0 = 0;
+          pollAutopDevice(); draw();
+        } else {
+          // 当前未启用：执行启动逻辑
+          const mode = (autopModeSel && autopModeSel.value) || 'mpc';
+          await fetch('/api/autop', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: true, start: true, mode }) });
+          ctrl.running = true; startPauseBtn.textContent = '暂停';
+          autopStartBtn.textContent = '停止自动跟踪';
+          // 清空所有图表并从零开始绘制，取消暂停
+          try {
+            for (const k of Object.keys(charts)) clearChart(k);
+            plotsStartMs = performance.now();
+            globalPaused = false;
+            for (const k of Object.keys(plotPaused)) {
+              plotPaused[k] = false;
+              const pbtn = document.getElementById(`pause_${k}`);
+              if (pbtn) pbtn.textContent = '暂停记录';
+            }
+            const gPauseBtn = document.getElementById('global_pause');
+            if (gPauseBtn) gPauseBtn.textContent = '暂停记录';
+          } catch {}
+          view.follow = true; centerOnVehicle();
+          pollAutopDevice();
+        }
+      } catch (e) { console.warn('自动跟踪切换失败', e); }
     });
   }
-  autopStopBtn.addEventListener('click', async () => {
-    try {
-      // 1) 关闭自动跟踪
-      await fetch('/api/autop', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: false }) });
-      // 2) 暂停仿真
-      await fetch('/api/sim/start_pause', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ running: false }) });
-      // 3) 归零前后轮角，避免残留角度继续影响行驶
-      const res = await fetch('/api/control', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ df_deg: 0, dr_deg: 0 }) });
-      ctrl = await res.json();
-      // 4) 同步 UI 状态
-      startPauseBtn.textContent = '开始';
-      arrived = false; arriveTick = 0; arrivalAnim.active = false; arrivalAnim.t0 = 0;
-      pollAutopDevice();
-      draw();
-    } catch (e) { console.warn('停止自动跟踪失败', e); }
-  });
+  if (exportPlanBtn) {
+    exportPlanBtn.addEventListener('click', () => { try { exportPlanCSV(); } catch (e) {} });
+  }
 
   // 跟随与网格
   const followChk = document.getElementById('follow_mode');
@@ -435,6 +624,7 @@ function bindUI() {
   }
   window.addEventListener('resize', resizeCanvas);
   resizeCanvas();
+  setupPlots();
 
   // 工具栏
   document.getElementById('zoom_in').addEventListener('click', () => { view.scale *= 1.2; draw(); });
@@ -491,6 +681,7 @@ function bindUI() {
         }
       }
       draw();
+      updatePlots();
     } catch (e) {}
   }
   setInterval(pollOnce, 100); // 10Hz 轮询
@@ -806,6 +997,38 @@ function exportTelemetryCSV() {
   }
 }
 
+// 导出当前规划轨迹为 CSV 文件
+function exportPlanCSV() {
+  try {
+    if (!Array.isArray(plan) || plan.length === 0) { alert('当前无可导出的规划'); return; }
+    const hasTime = typeof plan[0].t === 'number';
+    const t0 = hasTime ? plan[0].t : null;
+    const rows = [];
+    rows.push('t,x,y,psi');
+    for (let i = 0; i < plan.length; i++) {
+      const p = plan[i] || {};
+      const t = (hasTime && typeof p.t === 'number') ? (t0 !== null ? (p.t - t0) : p.t) : '';
+      const x = (typeof p.x === 'number') ? p.x : '';
+      const y = (typeof p.y === 'number') ? p.y : '';
+      const psi = (typeof p.psi === 'number') ? p.psi : '';
+      rows.push(`${t},${x},${y},${psi}`);
+    }
+    const csv = rows.join('\n');
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    const ts = new Date().toISOString().replace(/[:.]/g, '-');
+    a.download = `plan_${ts}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 0);
+  } catch (e) {
+    console.warn('导出规划 CSV 失败', e);
+    alert('导出失败，请稍后重试');
+  }
+}
+
 // 后端交互（节流）
 let postTimer = null;
 function schedulePostParams() {
@@ -848,3 +1071,118 @@ function normAngle(a) { let x = a; while (x > Math.PI) x -= 2 * Math.PI; while (
 function angleDiff(a, b) { return normAngle(a - b); }
 function deg(rad) { return rad * 180 / Math.PI; }
 function rad(deg) { return deg * Math.PI / 180; }
+// 每图控制：显示/隐藏、锁定Y范围、导出CSV
+const plotCfg = {
+  epsi: { show: true, lockY: false, yMin: null, yMax: null },
+  ey:   { show: true, lockY: false, yMin: null, yMax: null },
+  df:   { show: true, lockY: false, yMin: null, yMax: null },
+  beta: { show: true, lockY: false, yMin: null, yMax: null },
+  u:    { show: true, lockY: false, yMin: null, yMax: null },
+};
+const plotPaused = { epsi: true, ey: true, df: true, beta: true, u: true };
+let globalPaused = true;
+
+function applyYLock(key) {
+  const chart = charts[key]; if (!chart) return;
+  const cfg = plotCfg[key];
+  if (cfg.lockY && isFinite(cfg.yMin ?? NaN) && isFinite(cfg.yMax ?? NaN)) {
+    chart.options.scales.y.min = Number(cfg.yMin);
+    chart.options.scales.y.max = Number(cfg.yMax);
+  } else {
+    chart.options.scales.y.min = undefined;
+    chart.options.scales.y.max = undefined;
+  }
+  chart.update('none');
+}
+
+function exportChartCSV(key) {
+  const chart = charts[key]; if (!chart) return;
+  const labels = chart.data.labels.map((s) => Number(s));
+  const cols = chart.data.datasets.map((ds) => ({ name: ds.label || 'value', data: ds.data }));
+  let header = 't';
+  for (const c of cols) header += `,${c.name}`;
+  let csv = header + '\n';
+  for (let i = 0; i < labels.length; i++) {
+    const row = [labels[i]];
+    for (const c of cols) row.push(c.data[i] ?? '');
+    csv += row.join(',') + '\n';
+  }
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a'); a.href = url; a.download = `${key}.csv`;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url);
+}
+
+function exportAllChartsCSV() {
+  // 合并导出：t、epsi、ey、df、dr、beta
+  const epsi = charts.epsi; const ey = charts.ey; const df = charts.df; const beta = charts.beta; const u = charts.u;
+  if (!epsi || !ey || !df || !beta || !u) { alert('图表尚未就绪'); return; }
+  const N = Math.min(epsi.data.labels.length, ey.data.labels.length, df.data.labels.length, beta.data.labels.length, u.data.labels.length);
+  const labels = epsi.data.labels.slice(-N).map((s) => Number(s));
+  const epsiVals = epsi.data.datasets[0].data.slice(-N);
+  const eyVals = ey.data.datasets[0].data.slice(-N);
+  const dfVals = df.data.datasets[0].data.slice(-N);
+  const drVals = df.data.datasets[1] ? df.data.datasets[1].data.slice(-N) : [];
+  const betaVals = beta.data.datasets[0].data.slice(-N);
+  const uVals = u.data.datasets[0].data.slice(-N);
+  let csv = 't,epsi,ey,df,dr,beta,U\n';
+  for (let i = 0; i < N; i++) {
+    const row = [labels[i], epsiVals[i] ?? '', eyVals[i] ?? '', dfVals[i] ?? '', drVals[i] ?? '', betaVals[i] ?? '', uVals[i] ?? ''];
+    csv += row.join(',') + '\n';
+  }
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a'); a.href = url;
+  const ts = new Date().toISOString().replace(/[:.]/g, '-');
+  a.download = `charts_${ts}.csv`;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url);
+}
+
+function bindPlotControls() {
+  const keys = ['epsi','ey','df','beta'];
+  for (const key of keys) {
+    const exportEl = document.getElementById(`export_${key}`);
+    const pauseEl = document.getElementById(`pause_${key}`);
+    const clearEl = document.getElementById(`clear_${key}`);
+    if (exportEl) exportEl.addEventListener('click', () => exportChartCSV(key));
+    if (pauseEl) {
+      pauseEl.addEventListener('click', () => {
+        plotPaused[key] = !plotPaused[key];
+        pauseEl.textContent = plotPaused[key] ? '开始记录' : '暂停记录';
+      });
+    }
+    if (clearEl) clearEl.addEventListener('click', () => clearChart(key));
+  }
+}
+
+function bindGlobalPlotControls() {
+  const pauseBtn = document.getElementById('global_pause');
+  const clearBtn = document.getElementById('global_clear');
+  const exportBtn = document.getElementById('global_export');
+  // 初始按钮文案与全局暂停状态
+  if (pauseBtn) { pauseBtn.textContent = globalPaused ? '开始记录' : '暂停记录'; }
+  for (const k of Object.keys(plotPaused)) plotPaused[k] = globalPaused;
+  if (pauseBtn) {
+    pauseBtn.addEventListener('click', () => {
+      globalPaused = !globalPaused;
+      // 同步所有图表的暂停状态
+      for (const k of Object.keys(plotPaused)) plotPaused[k] = globalPaused;
+      pauseBtn.textContent = globalPaused ? '开始记录' : '暂停记录';
+    });
+  }
+  if (clearBtn) {
+    clearBtn.addEventListener('click', () => {
+      for (const k of Object.keys(charts)) clearChart(k);
+      // 重置时间轴，使清空后重新从0开始
+      plotsStartMs = performance.now();
+    });
+  }
+  if (exportBtn) exportBtn.addEventListener('click', () => exportAllChartsCSV());
+}
+
+function clearChart(key) {
+  const chart = charts[key]; if (!chart) return;
+  chart.data.labels = [];
+  for (const ds of chart.data.datasets) { ds.data = []; }
+  chart.update('none');
+}
