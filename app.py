@@ -440,6 +440,7 @@ def api_autop():
         return jsonify({
             'enabled': bool(ENGINE.autop_enabled),
             'mode': getattr(ENGINE, 'autop_mode', 'simple'),
+            'controller': ENGINE.get_controller_type() if hasattr(ENGINE, 'get_controller_type') else getattr(ENGINE, 'autop_mode', 'simple'),
             'plan_count': len(getattr(ENGINE, 'plan', []) or []),
             'device': dev,
             'device_active': dev_active,
@@ -478,7 +479,13 @@ def api_autop():
     except Exception:
         if dev is None:
             dev = 'cpu'
-    return jsonify({'enabled': bool(ENGINE.autop_enabled), 'mode': getattr(ENGINE, 'autop_mode', 'simple'), 'device': dev, 'device_active': dev_active})
+    return jsonify({
+        'enabled': bool(ENGINE.autop_enabled),
+        'mode': getattr(ENGINE, 'autop_mode', 'simple'),
+        'controller': ENGINE.get_controller_type() if hasattr(ENGINE, 'get_controller_type') else getattr(ENGINE, 'autop_mode', 'simple'),
+        'device': dev,
+        'device_active': dev_active,
+    })
 
 # 仿真模式：2DOF / 3DOF
 @app.route('/api/mode', methods=['GET', 'POST'])

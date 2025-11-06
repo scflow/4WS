@@ -70,13 +70,15 @@ def slip_angles_2dof(beta: float, r: float, df: float, dr: float, a: float, b: f
 
 
 def slip_angles_3dof(vx: float, vy: float, r: float, df: float, dr: float, a: float, b: float, U_min: float) -> Tuple[float, float]:
-    """3DOF 自行车模型侧偏角：使用 arctan2(vy ± a/b * r, |vx|_eff) - d。
+    """3DOF 自行车模型侧偏角：alpha = atan2(vy ± a/b * r, vx_eff) - d。
 
-    - 近零保护采用速度幅值，允许倒车（vx 为负）。
+    说明
+    - 低速/近零 vx 时，直接使用原始 vx 计算会导致 |alpha| 接近 π/2，产生不合理的横向力；
+    - 使用 `vx_eff = sign(vx) * max(|vx|, U_min)` 进行近零保护，保持方向一致同时避免极端侧偏角；
     """
-    vx_eff = max(float(U_min), abs(float(vx)))
-    alpha_f = math.atan2(float(vy) + float(a) * float(r), vx_eff) - float(df)
-    alpha_r = math.atan2(float(vy) - float(b) * float(r), vx_eff) - float(dr)
+    vx_eff = math.copysign(max(float(U_min), abs(float(vx))), float(vx))
+    alpha_f = math.atan2(float(vy) + float(a) * float(r), float(vx_eff)) - float(df)
+    alpha_r = math.atan2(float(vy) - float(b) * float(r), float(vx_eff)) - float(dr)
     return float(alpha_f), float(alpha_r)
 
 

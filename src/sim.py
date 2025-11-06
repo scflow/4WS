@@ -75,6 +75,9 @@ class SimEngine:
         self.autop_enabled: bool = False
         self.autop_mode: Literal['simple', 'mpc', 'mppi'] = 'mpc'
         self._plan_idx: int = 0
+        # 控制器类型指示与几何回退标记
+        self.controller_type: Literal['simple', 'mpc', 'mppi', 'geometric', 'manual'] = 'manual'
+        self._geom_fallback_active: bool = False
         # 目标位姿与重规划开关
         self.goal_pose_end: Dict[str, float] | None = None
         self.replan_every_step: bool = False
@@ -218,12 +221,9 @@ class SimEngine:
             # 牵引分配（模块化函数）：角度相关衰减 + 轴向比例
             Fx_f_pure, Fx_r_pure = allocate_drive(Fx_total, df, dr, self.drive_bias_front, self.drive_bias_rear)
 
-            # 3DOF 导数（模块化函数）：包含轮胎侧偏、摩擦椭圆与动力学方程
-            ds, aux = derivatives_dfdr(self.state3, df, dr, vp3, Fx_f_pure, Fx_r_pure)
-
-            # 低速融合（3DOF）：将动力学导数与几何导数按速度平滑混合
+            # 低速融合（3DOF）：基于纵向速度 |vx| 计算权重，避免 vy 影响导致低速下切入动力学
             U_signed = float(self.ctrl.U)
-            speed_mag = float(np.hypot(self.state3.vx, self.state3.vy))
+            speed_mag = float(abs(self.state3.vx))
             U_blend = max(1e-9, float(getattr(self.params, 'U_blend', 0.3)))
             t = max(0.0, min(1.0, speed_mag / U_blend))
             w = t * t * (3.0 - 2.0 * t)
@@ -234,8 +234,13 @@ class SimEngine:
             vx_dot_kin = ax_cmd  # 与上方速度跟踪一致
             vy_dot_kin = - self.state3.vy / max(1e-6, self.tau_beta)
             xdot_kin, ydot_kin = body_to_world_2dof(U_signed, 0.0, self.state3.psi)
-            # 动力学导数分量
-            vx_dot_dyn, vy_dot_dyn, r_dot_dyn, x_dot_dyn, y_dot_dyn, psi_dot_dyn = map(float, ds)
+            # 动力学导数分量：低速时跳过昂贵且不稳定的动力学计算
+            if w < 0.99:
+                vx_dot_dyn, vy_dot_dyn, r_dot_dyn = 0.0, 0.0, 0.0
+                x_dot_dyn, y_dot_dyn = 0.0, 0.0
+            else:
+                ds, aux = derivatives_dfdr(self.state3, df, dr, vp3, Fx_f_pure, Fx_r_pure)
+                vx_dot_dyn, vy_dot_dyn, r_dot_dyn, x_dot_dyn, y_dot_dyn, _psi_dot_dyn = map(float, ds)
             # 混合
             vx_dot = w * vx_dot_dyn + (1.0 - w) * vx_dot_kin
             vy_dot = w * vy_dot_dyn + (1.0 - w) * vy_dot_kin
@@ -367,6 +372,9 @@ class SimEngine:
     def set_autop(self, enabled: bool):
         with self._lock:
             self.autop_enabled = bool(enabled)
+            if not self.autop_enabled:
+                # 自动关闭时显示为手动控制
+                self.controller_type = 'manual'
             # 移除启用即每步重规划，避免参考轨迹每步从当前点起导致误差始终为零
             # 默认保持当前重规划设置（初始为 False），如需开启由设置接口控制
             # self.replan_every_step = bool(enabled)
@@ -376,9 +384,20 @@ class SimEngine:
             m = str(mode or '').lower()
             if m in ('simple', 'mpc', 'mppi'):
                 self.autop_mode = m
+                if self.autop_enabled:
+                    self.controller_type = m
             else:
                 # 保底：不识别即保持当前
                 pass
+
+    def get_controller_type(self) -> str:
+        """返回当前控制器类型：simple/mpc/mppi/geometric/manual"""
+        with self._lock:
+            if not self.autop_enabled or len(self.plan) == 0:
+                return 'manual'
+            if self._geom_fallback_active:
+                return 'geometric'
+            return self.controller_type
 
     def _replan_to_goal(self):
         """基于当前状态与目标位姿进行短周期重规划，减少累积误差。"""
@@ -514,6 +533,8 @@ class SimEngine:
         """纯追踪（Pure Pursuit）：选择预瞄点，用几何公式输出前轮角，后轮用理想横摆补偿。"""
         if not (self.autop_enabled and self.mode == '2dof' and len(self.plan) > 0):
             return
+        # 当前控制器类型：Simple
+        self.controller_type = 'simple'
         x = float(self.state2.x)
         y = float(self.state2.y)
         psi_cur = float(self.state2.psi)
@@ -543,6 +564,59 @@ class SimEngine:
         self._dr_filt += alpha_f * (dr_cmd - self._dr_filt)
         self.ctrl.delta_f = float(self._df_filt)
         self.ctrl.delta_r = float(self._dr_filt)
+
+    def _fallback_geom_3dof(self) -> None:
+        """3DOF 下的几何型回退：
+        - 前轮采用纯追踪几何角；
+        - 后轮采用速度/曲率门控的相位比例 k_t 近似；
+        - 速度采用弯道限速的简单追踪（基于 ay 限）。
+        在 MPPI 失败时保持控制更新，避免速度与转角停滞。
+        """
+        if not (self.autop_enabled and self.mode == '3dof' and len(self.plan) > 0):
+            return
+        try:
+            self._geom_fallback_active = True
+            self.controller_type = 'geometric'
+            x = float(getattr(self.state3, 'x', self.state2.x))
+            y = float(getattr(self.state3, 'y', self.state2.y))
+            psi_cur = float(getattr(self.state3, 'psi', self.state2.psi))
+            U_mag = float(np.hypot(getattr(self.state3, 'vx', self.params.U_eff()), getattr(self.state3, 'vy', 0.0)))
+            ref = self._plan_ref_geometry(x, y, psi_cur, U_mag)
+
+            # 纯追踪前轮角
+            i_goal = min(len(self.plan) - 1, int(ref['ref_i'] + 1))
+            p_goal = self.plan[i_goal]
+            alpha = self._wrap_angle(float(np.arctan2(p_goal['y'] - y, p_goal['x'] - x)) - psi_cur)
+            L = float(self.params.L)
+            Ld = float(max(1.0, ref['Ld']))
+            df_cmd_raw = float(np.arctan2(2.0 * L * np.sin(alpha), Ld))
+            df_cmd = float(np.clip(df_cmd_raw, -self.delta_max, self.delta_max))
+
+            # 后轮相位比例（近似）：强弯鼓励反相，高速直线允许微弱同相
+            kappa_mag = abs(float(ref['kappa_ref']))
+            G_turn = max(0.0, min(1.0, (kappa_mag - 0.02) / (0.06 - 0.02 + 1e-9)))
+            s_lin = max(0.0, min(1.0, (U_mag - 5.0) / (20.0 - 5.0)))
+            k_t = (-0.8 * G_turn) + (0.10 * (1.0 - G_turn) * s_lin)
+            dr_cmd = float(np.clip(k_t * df_cmd, -self.delta_max, self.delta_max))
+
+            # 速度弯道限速（基于横向加速度限制）
+            ay_limit = float(getattr(self.params, 'mu', 1.0) * getattr(self.params, 'g', 9.81)) * float(self.ay_limit_coeff)
+            if kappa_mag > 1e-6:
+                U_des = float(np.sqrt(max(0.0, ay_limit / max(1e-6, kappa_mag))))
+            else:
+                U_des = float(self.U_cruise)
+            dU = float(np.clip(U_des - self.ctrl.U, -self.dU_max * self.dt, self.dU_max * self.dt))
+            U_next = float(np.clip(self.ctrl.U + dU, 0.0, self.U_max))
+
+            # 平滑并写回
+            alpha_f = 1.0 - np.exp(-self.dt / max(1e-6, self.tau_ctrl))
+            self._df_filt += alpha_f * (df_cmd - self._df_filt)
+            self._dr_filt += alpha_f * (dr_cmd - self._dr_filt)
+            self.ctrl.delta_f = float(self._df_filt)
+            self.ctrl.delta_r = float(self._dr_filt)
+            self.ctrl.U = U_next
+        except Exception as e:
+            print(f"[SimEngine] 几何型 3DOF 回退异常: {e}")
 
     def _autop_update_mppi(self):
         """使用 MPPI（2DOF 或 3DOF）进行并行滚动首步控制求解。"""
@@ -578,9 +652,12 @@ class SimEngine:
                         delta_rate_frac=float(self.delta_rate_frac),
                     )
                 except Exception as e:
-                    print(f"[SimEngine] MPPI 异常原因: {e}")
-                    # CPU 也失败则退回 simple 模式
-                    self.autop_mode = 'simple'
+                    print(f"[SimEngine] MPPI 初始化失败（含 CPU 回退）: {e}. 使用几何型 3DOF 回退。")
+                    # 初始化阶段也失败：执行 3DOF 几何回退，保持控制更新
+                    try:
+                        self._fallback_geom_3dof()
+                    except Exception as e_fb:
+                        print(f"[SimEngine] 3DOF 几何回退失败: {e_fb}")
                     return
             # 传递牵引分配与速度控制增益到控制器（3DOF 使用）
             try:
@@ -624,9 +701,45 @@ class SimEngine:
         # 求解控制动作 u = [d_delta_f, d_delta_r, dU]
         try:
             u_np = self._mppi_ctrl.command(s_np)
-        except Exception:
-            return
+        except Exception as e:
+            # 运行期失败时：记录错误并尝试切换到 CPU 设备后重试
+            print(f"[SimEngine] MPPI.command 失败: {e}. 尝试切换到 CPU 回退。")
+            try:
+                ctrl_dev = str(getattr(self._mppi_ctrl, 'device', 'cpu')).lower()
+                if ctrl_dev != 'cpu':
+                    from .mppi_iface import MPPIController4WS
+                    self._mppi_ctrl = MPPIController4WS(
+                        params=self.params,
+                        dt=self.dt,
+                        plan_provider=lambda: self.plan,
+                        delta_max=float(self.delta_max),
+                        dU_max=float(self.dU_max),
+                        U_max=float(self.U_max),
+                        device='cpu',
+                        model_type=('3dof' if self.mode == '3dof' else '2dof'),
+                        delta_rate_frac=float(self.delta_rate_frac),
+                    )
+                    u_np = self._mppi_ctrl.command(s_np)
+                else:
+                    # 已在 CPU 上仍失败：执行 3DOF 几何回退，避免控制停滞
+                    print("[SimEngine] MPPI 在 CPU 上仍失败，改用几何型 3DOF 回退。")
+                    try:
+                        self._fallback_geom_3dof()
+                    except Exception as e_fb:
+                        print(f"[SimEngine] 3DOF 几何回退失败: {e_fb}")
+                    return
+            except Exception as e2:
+                print(f"[SimEngine] MPPI CPU 回退也失败: {e2}")
+                # 再次失败：执行 3DOF 几何回退（保持控制更新）
+                try:
+                    self._fallback_geom_3dof()
+                except Exception as e_fb:
+                    print(f"[SimEngine] 3DOF 几何回退失败: {e_fb}")
+                return
         d_df_cmd, d_dr_cmd, dU_cmd = float(u_np[0]), float(u_np[1]), float(u_np[2])
+        # 正常得到 MPPI 指令：清除几何回退标记并更新类型
+        self._geom_fallback_active = False
+        self.controller_type = 'mppi'
         # 角度积分与限幅；速度边界（2DOF: 实际速度；3DOF: 速度指令）
         df_next = float(np.clip(self.ctrl.delta_f + d_df_cmd, -self.delta_max, self.delta_max))
         dr_next = float(np.clip(self.ctrl.delta_r + d_dr_cmd, -self.delta_max, self.delta_max))
@@ -666,6 +779,8 @@ class SimEngine:
         """调用外部模块的 MPC 求解（使用 4-DOF 运动学-动力学模型）。"""
         if not (self.autop_enabled and self.mode == '2dof' and len(self.plan) > 0):
             return
+        # 显示当前控制器类型（用于前端指示）
+        self.controller_type = 'mpc'
 
         # --- 1. 获取当前状态 ---
         state_raw = {
@@ -732,7 +847,7 @@ class SimEngine:
             self.dt,
             H=20,           # 预测时域
             Q_ey=100,      # !! 高横向误差惩罚
-            Q_epsi=500,     # !! 高航向误差惩罚
+            Q_epsi=10000,     # !! 高航向误差惩罚
             Q_beta=20,     # 低侧滑惩罚
             Q_r=0.1,        # 低横摆率惩罚 (主要靠 e_psi)
             R_df=2,       # 低控制代价

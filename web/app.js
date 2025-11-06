@@ -196,12 +196,32 @@ function setDeviceIndicator(dev, active) {
   label.classList.toggle('inactive', !active);
   label.textContent = text;
 }
+
+// 控制器类型指示器（simple/mpc/mppi/geometric/manual）
+function setControllerIndicator(type, enabled) {
+  const dot = document.getElementById('ctl_dot');
+  const label = document.getElementById('ctl_label');
+  if (!dot || !label) return;
+  const t = (type || '').toLowerCase();
+  let cls = 'muted';
+  let text = 'N/A';
+  if (!enabled) { cls = 'muted'; text = '手动'; }
+  else if (t === 'simple') { cls = 'muted'; text = 'Simple'; }
+  else if (t === 'mpc') { cls = 'ok'; text = 'MPC'; }
+  else if (t === 'mppi') { cls = 'accent'; text = 'MPPI'; }
+  else if (t === 'geometric') { cls = 'bad'; text = '几何'; }
+  else { cls = 'muted'; text = (type || 'N/A'); }
+  dot.classList.remove('ok','bad','accent','muted');
+  dot.classList.add(cls);
+  label.textContent = text;
+}
 async function pollAutopDevice() {
   try {
     const res = await fetch('/api/autop', { cache: 'no-store' });
     if (!res.ok) return;
     const data = await res.json();
     setDeviceIndicator(data.device || null, !!data.device_active);
+    setControllerIndicator(data.controller || data.mode || null, !!data.enabled);
   } catch {}
 }
 

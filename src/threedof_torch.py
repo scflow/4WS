@@ -43,11 +43,14 @@ def slip_angles_3dof_torch(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """3DOF 自行车模型侧偏角（Torch 版）。
 
-    alpha_f = atan2(vy + a*r, |vx|_eff) - df
-    alpha_r = atan2(vy - b*r, |vx|_eff) - dr
-    使用 |vx| 的幅值与 U_min 做近零保护；支持广播。
+    alpha_f = atan2(vy + a*r, vx) - df
+    alpha_r = atan2(vy - b*r, vx) - dr
+    近零保护：使用 vx_eff = sign(vx) * max(|vx|, U_min) 避免低速时 |alpha| 过大。
     """
-    vx_eff = torch.clamp(torch.abs(vx), min=float(U_min))
+    # 低速近零保护（保持符号）
+    U_min_t = torch.tensor(float(U_min), dtype=vx.dtype, device=vx.device)
+    vx_mag = torch.abs(vx)
+    vx_eff = torch.where(vx_mag < U_min_t, torch.sign(vx) * U_min_t, vx)
     alpha_f = torch.atan2(vy + (a * r), vx_eff) - df
     alpha_r = torch.atan2(vy - (b * r), vx_eff) - dr
     return alpha_f, alpha_r

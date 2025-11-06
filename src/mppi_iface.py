@@ -56,9 +56,9 @@ class MPPIController4WS:
         self.device = device or ('mps' if mps_available else ('cuda' if torch.cuda.is_available() else 'cpu'))
 
         self.w_lat = 2000.0
-        self.w_head = 4000.0
+        self.w_head = 40000
         # 直线速度激励（机会成本），弯道弱化
-        self.w_speed = 12.0
+        self.w_speed = 10.0
         self.w_u = 1.0
         self.w_du = 3.0
         # 速度相关的相位约束（低速更强反相，高速弱同相）
