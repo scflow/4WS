@@ -1,14 +1,14 @@
 import logging
 import abc
-
-import numpy as np
-import torch
 import typing
+import random
 
-from arm_pytorch_utilities.tensor_utils import ensure_tensor
-from torch.distributions import MultivariateNormal
+import mlx.core as mx
 
-from pytorch_mppi import MPPI
+def ensure_array(dtype, value):
+    return mx.array(value, dtype=dtype if dtype is not None else mx.float32)
+
+from .mppi import MPPI
 # optimizers
 import cma
 
@@ -17,9 +17,9 @@ logger = logging.getLogger(__file__)
 
 class EvaluationResult(typing.NamedTuple):
     # (N) cost for each trajectory evaluated
-    costs: torch.Tensor
+    costs: typing.Any
     # (N x H x nx) where H is the horizon and nx is the state dimension
-    rollouts: torch.Tensor
+    rollouts: typing.Any
     # parameter values populated by the tuner after evaluation returns
     params: dict = None
     # iteration number populated by the tuner after evaluation returns
@@ -59,8 +59,7 @@ class CMAESOpt(Optimizer):
 
     def setup_optimization(self):
         x0 = self.tuner.flatten_params()
-
-        options = {"popsize": self.population, "seed": np.random.randint(0, 10000), "tolfun": 1e-5, "tolfunhist": 1e-6}
+        options = {"popsize": self.population, "seed": random.randint(0, 10000), "tolfun": 1e-5, "tolfunhist": 1e-6}
         self.optim = cma.CMAEvolutionStrategy(x0=x0, sigma0=self.sigma, inopts=options)
 
     def optimize_step(self):
@@ -72,10 +71,8 @@ class CMAESOpt(Optimizer):
         for param in params:
             self.tuner.unflatten_params(param)
             res = self.tuner.evaluate_fn()
-            cost_per_param.append(res.costs.mean().cpu().numpy())
+            cost_per_param.append(float(mx.mean(mx.array(res.costs))))
             all_rollouts.append(res.rollouts)
-
-        cost_per_param = np.array(cost_per_param)
         self.optim.tell(params, cost_per_param)
 
         best_param = self.optim.best.x
@@ -148,24 +145,30 @@ class SigmaParameter(MPPIParameter):
         return self._dim
 
     def get_current_parameter_value(self):
-        return torch.cat([self.mppi.noise_sigma[i][i].view(1) for i in range(self.dim())])
+        n = self.dim()
+        diag = mx.sum(self.mppi.noise_sigma * mx.eye(n, dtype=self.dtype), axis=1)
+        return ensure_array(self.dtype, diag)
 
     def ensure_valid_value(self, value):
-        sigma = ensure_tensor(self.d, self.dtype, value)
-        sigma[sigma < self.eps] = self.eps
+        sigma = ensure_array(self.dtype, value)
+        sigma = mx.maximum(sigma, self.eps)
         return sigma
 
     def apply_parameter_value(self, value):
         sigma = self.ensure_valid_value(value)
-        self.mppi.noise_sigma = torch.diag(sigma)
-        self.mppi.noise_dist = MultivariateNormal(self.mppi.noise_mu, covariance_matrix=self.mppi.noise_sigma)
-        self.mppi.noise_sigma_inv = torch.inverse(self.mppi.noise_sigma.detach())
+        n = self.dim()
+        cov = mx.eye(n, dtype=self.mppi.dtype) * mx.reshape(sigma, (n, 1))
+        self.mppi.noise_sigma = cov
+        self.mppi.noise_dist = type(self.mppi.noise_dist)(self.mppi.noise_mu, self.mppi.noise_sigma, self.mppi.dtype)
+        with mx.stream(mx.cpu):
+            self.mppi.noise_sigma_inv = mx.linalg.inv(self.mppi.noise_sigma)
 
     def get_parameter_value_from_config(self, config):
-        return torch.tensor([config[f'{self.name()}{i}'] for i in range(self.dim())], dtype=self.dtype, device=self.d)
+        return ensure_array(self.dtype, [config[f'{self.name()}{i}'] for i in range(self.dim())])
 
     def get_config_from_parameter_value(self, value):
-        return {f'{self.name()}{i}': value[i].item() for i in range(self.dim())}
+        val = value.tolist() if hasattr(value, 'tolist') else list(value)
+        return {f'{self.name()}{i}': float(val[i]) for i in range(self.dim())}
 
 
 class MuParameter(MPPIParameter):
@@ -177,22 +180,25 @@ class MuParameter(MPPIParameter):
         return self._dim
 
     def get_current_parameter_value(self):
-        return self.mppi.noise_mu.clone()
+        return ensure_array(self.dtype, self.mppi.noise_mu)
 
     def ensure_valid_value(self, value):
-        mu = ensure_tensor(self.d, self.dtype, value)
+        mu = ensure_array(self.dtype, value)
         return mu
 
     def apply_parameter_value(self, value):
         mu = self.ensure_valid_value(value)
-        self.mppi.noise_dist = MultivariateNormal(mu, covariance_matrix=self.mppi.noise_sigma)
-        self.mppi.noise_sigma_inv = torch.inverse(self.mppi.noise_sigma.detach())
+        self.mppi.noise_mu = ensure_array(self.mppi.dtype, mu)
+        self.mppi.noise_dist = type(self.mppi.noise_dist)(self.mppi.noise_mu, self.mppi.noise_sigma, self.mppi.dtype)
+        with mx.stream(mx.cpu):
+            self.mppi.noise_sigma_inv = mx.linalg.inv(self.mppi.noise_sigma)
 
     def get_parameter_value_from_config(self, config):
-        return torch.tensor([config[f'{self.name()}{i}'] for i in range(self.dim())], dtype=self.dtype, device=self.d)
+        return ensure_array(self.dtype, [config[f'{self.name()}{i}'] for i in range(self.dim())])
 
     def get_config_from_parameter_value(self, value):
-        return {f'{self.name()}{i}': value[i].item() for i in range(self.dim())}
+        val = value.tolist() if hasattr(value, 'tolist') else list(value)
+        return {f'{self.name()}{i}': float(val[i]) for i in range(self.dim())}
 
 
 class LambdaParameter(MPPIParameter):
@@ -209,9 +215,12 @@ class LambdaParameter(MPPIParameter):
         return self.mppi.lambda_
 
     def ensure_valid_value(self, value):
-        if torch.is_tensor(value) or isinstance(value, np.ndarray):
+        if hasattr(value, 'tolist'):
+            arr = value.tolist()
+            value = arr[0] if isinstance(arr, list) else float(arr)
+        elif isinstance(value, (list, tuple)):
             value = value[0]
-        v = max(value, self.eps)
+        v = max(float(value), self.eps)
         return v
 
     def apply_parameter_value(self, value):
@@ -231,9 +240,12 @@ class HorizonParameter(MPPIParameter):
         return self.mppi.T
 
     def ensure_valid_value(self, value):
-        if torch.is_tensor(value) or isinstance(value, np.ndarray):
+        if hasattr(value, 'tolist'):
+            arr = value.tolist()
+            value = arr[0] if isinstance(arr, list) else float(arr)
+        elif isinstance(value, (list, tuple)):
             value = value[0]
-        v = max(round(value), 1)
+        v = max(round(float(value)), 1)
         return v
 
     def apply_parameter_value(self, value):
@@ -281,17 +293,16 @@ class Autotune:
         return res
 
     def get_best_result(self) -> EvaluationResult:
-        return min(self.results, key=lambda res: res.costs.mean().item())
+        return min(self.results, key=lambda res: float(mx.mean(mx.array(res.costs))))
 
     def log_current_result(self, res: EvaluationResult):
-        with torch.no_grad():
-            iteration = len(self.results)
-            kv = self.get_parameter_values(self.params)
-            res = res._replace(iteration=iteration,
-                               params={k: v.detach().clone() if torch.is_tensor(v) else v for k, v in
-                                       kv.items()})
-            logger.info(f"i:{iteration} cost: {res.costs.mean().item()} params:{kv}")
-            self.results.append(res)
+        iteration = len(self.results)
+        kv = self.get_parameter_values(self.params)
+        # 复制参数值以免外部修改影响记录
+        copied = {k: (v.copy() if hasattr(v, 'copy') else v) for k, v in kv.items()}
+        res = res._replace(iteration=iteration, params=copied)
+        logger.info(f"i:{iteration} cost: {float(mx.mean(mx.array(res.costs)))} params:{kv}")
+        self.results.append(res)
         return res
 
     def get_parameter_values(self, params_to_tune: typing.Sequence[TunableParameter]):
@@ -299,15 +310,19 @@ class Autotune:
         return {p.name(): p.get_current_parameter_value() for p in params_to_tune}
 
     def flatten_params(self):
-        x = []
+        x: typing.List[float] = []
         kv = self.get_parameter_values(self.params)
-        # TODO ensure this is the same order as define and unflatten
         for k, v in kv.items():
-            if torch.is_tensor(v):
-                x.append(v.detach().cpu().numpy())
+            if hasattr(v, 'tolist'):
+                arr_list = v.tolist()
+                if isinstance(arr_list, list):
+                    x.extend([float(a) for a in arr_list])
+                else:
+                    x.append(float(arr_list))
+            elif isinstance(v, (list, tuple)):
+                x.extend([float(a) for a in v])
             else:
-                x.append([v])
-        x = np.concatenate(x)
+                x.append(float(v))
         return x
 
     def unflatten_params(self, x, apply=True):

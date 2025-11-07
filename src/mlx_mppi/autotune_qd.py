@@ -1,10 +1,22 @@
-import numpy as np
+import random
+import mlx.core as mx
+
+# Helpers to strictly adapt arrays to Python float lists for ribs
+def _as_float_list(x):
+    if hasattr(x, "tolist"):
+        x = x.tolist()
+    return [float(v) for v in x]
+
+def _as_2d_float_list(x):
+    if hasattr(x, "tolist"):
+        x = x.tolist()
+    return [[float(v) for v in row] for row in x]
 
 # pip install ribs
 import ribs
 
-from pytorch_mppi import autotune
-from pytorch_mppi.autotune_global import AutotuneGlobal
+from . import autotune
+from .autotune_global import AutotuneGlobal
 
 
 class CMAMEOpt(autotune.Optimizer):
@@ -31,21 +43,23 @@ class CMAMEOpt(autotune.Optimizer):
             raise RuntimeError(f"Quality diversity optimizers require global search space information provided "
                                f"by AutotuneMPPIGlobal")
 
-        x = self.tuner.flatten_params()
-        ranges = self.tuner.linearized_search_space()
-        ranges = list(ranges.values())
+        x = _as_float_list(self.tuner.flatten_params())
+        ranges_dict = self.tuner.linearized_search_space()
+        ranges = [(float(lo), float(hi)) for (lo, hi) in ranges_dict.values()]
 
         param_dim = len(x)
         bins = self.bins
         if isinstance(bins, (int, float)):
-            bins = [bins for _ in range(param_dim)]
+            bins = [int(bins) for _ in range(param_dim)]
+        else:
+            bins = [int(b) for b in bins]
         self.archive = ribs.archives.GridArchive(solution_dim=param_dim,
                                                  dims=bins,
                                                  ranges=ranges,
-                                                 seed=np.random.randint(0, 10000), qd_score_offset=self.qd_score_offset)
+                                                 seed=random.randint(0, 10000), qd_score_offset=self.qd_score_offset)
         emitters = [
-            ribs.emitters.EvolutionStrategyEmitter(self.archive, x0=x, sigma0=self.sigma, batch_size=self.population,
-                                                   seed=np.random.randint(0, 10000)) for i in
+            ribs.emitters.EvolutionStrategyEmitter(self.archive, x0=_as_float_list(x), sigma0=self.sigma, batch_size=self.population,
+                                                   seed=random.randint(0, 10000)) for i in
             range(self.num_emitters)
         ]
         self.optim = ribs.schedulers.Scheduler(self.archive, emitters)
@@ -55,36 +69,39 @@ class CMAMEOpt(autotune.Optimizer):
             raise RuntimeError(f"Quality diversity optimizers require global search space information provided "
                                f"by AutotuneMPPIGlobal")
 
-        params = self.optim.ask()
+        params = _as_2d_float_list(self.optim.ask())
         # measure is the whole hyperparameter set - we want to diverse along each dimension
 
         cost_per_param = []
         all_rollouts = []
         bcs = []
         for param in params:
-            full_param = self.tuner.unflatten_params(param)
+            full_param = self.tuner.unflatten_params(_as_float_list(param))
             res = self.tuner.evaluate_fn()
-            cost_per_param.append(res.costs.mean().cpu().numpy())
+            # Mean cost using MLX
+            cost_per_param.append(float(mx.mean(mx.array(res.costs))))
             all_rollouts.append(res.rollouts)
             behavior = self.tuner.linearize_params(full_param)
-            bcs.append(behavior)
+            bcs.append(_as_float_list(behavior))
 
-        cost_per_param = np.array(cost_per_param)
-        self.optim.tell(-cost_per_param, bcs)
+        # Provide objectives as negatives of costs without NumPy
+        objectives = [-float(c) for c in cost_per_param]
+        self.optim.tell(objectives, _as_2d_float_list(bcs))
 
         best_param = self.archive.best_elite
         # best_param = self.optim.best.x
-        self.tuner.unflatten_params(best_param.solution)
+        self.tuner.unflatten_params(_as_float_list(best_param.solution))
         res = self.tuner.evaluate_fn()
         return res
 
     def get_diverse_top_parameters(self, num_top):
         df = self.archive.as_pandas()
-        objectives = df.objective_batch()
-        solutions = df.solution_batch()
+        objectives = list(df.objective_batch())
+        solutions = _as_2d_float_list(df.solution_batch())
         # store to allow restoring on next step
         if len(solutions) > num_top:
-            order = np.argpartition(-objectives, num_top)
-            solutions = solutions[order[:num_top]]
+            # Select top-k solutions by objective without NumPy
+            indices = sorted(range(len(objectives)), key=lambda i: float(objectives[i]), reverse=True)[:num_top]
+            solutions = [_as_float_list(solutions[i]) for i in indices]
 
-        return [self.tuner.unflatten_params(x, apply=False) for x in solutions]
+        return [self.tuner.unflatten_params(_as_float_list(x), apply=False) for x in solutions]

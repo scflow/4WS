@@ -1,6 +1,5 @@
-#!/usr/bin/env python3
 """
-Plot Fx–Fy relationship from Pacejka (Torch) for given steering angles.
+Plot Fx–Fy relationship from Pacejka (MLX/NumPy) for given steering angles.
 
 Angles: 5°, 10°, 15°, 20°, 25°, 30°
 Uses current default parameters from src.tire and src.params.
@@ -11,7 +10,6 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib
 
-import torch
 import sys
 from pathlib import Path
 
@@ -20,10 +18,10 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.append(str(_ROOT))
 
-from src.tire_torch import (
-    pacejka_lateral_torch,
-    pacejka_longitudinal_torch,
-    combine_friction_ellipse_torch,
+from src.tire_mlx import (
+    pacejka_lateral_mlx,
+    pacejka_longitudinal_mlx,
+    combine_friction_ellipse_mlx,
 )
 from src.tire import PacejkaParams, PacejkaLongParams
 from src.params import VehicleParams
@@ -44,13 +42,12 @@ def main() -> None:
     mu_x = float(p_long.mu_x)
     mu_y = float(p_lat.mu_y)
 
-    # Torch setup
-    dtype = torch.float64
-    device = torch.device("cpu")
-    Fz_t = torch.tensor(Fz_tire, dtype=dtype, device=device)
+    # 数值设置：使用 NumPy 进行绘图计算（也兼容 MLX 内部调用）
+    dtype = np.float64
+    Fz_t = np.array(Fz_tire, dtype=dtype)
 
     # Longitudinal slip range (drive, positive)
-    lmbd_vals = torch.linspace(0.0, 1.0, 200, dtype=dtype, device=device)
+    lmbd_vals = np.linspace(0.0, 1.0, 200, dtype=dtype)
 
     # Use PingFang (苹方) font on macOS for proper CJK rendering
     # Try to register system PingFang if present; include robust fallbacks
@@ -76,19 +73,19 @@ def main() -> None:
 
     for deg in angles_deg:
         alpha_rad = np.deg2rad(deg)
-        alpha_t = torch.tensor(alpha_rad, dtype=dtype, device=device)
+        alpha_t = np.array(alpha_rad, dtype=dtype)
 
         # Pure forces
-        Fy_pure = pacejka_lateral_torch(alpha_t, Fz_t, p_lat)  # scalar tensor
-        Fx_pure = pacejka_longitudinal_torch(lmbd_vals, Fz_t, p_long)  # vector tensor
+        Fy_pure = pacejka_lateral_mlx(alpha_t, Fz_t, p_lat)  # scalar array
+        Fx_pure = pacejka_longitudinal_mlx(lmbd_vals, Fz_t, p_long)  # vector array
 
         # Combine via friction ellipse constraint (projection to boundary)
-        Fx_c, Fy_c = combine_friction_ellipse_torch(Fx_pure, Fy_pure, Fz_t, mu_x, mu_y)
+        Fx_c, Fy_c = combine_friction_ellipse_mlx(Fx_pure, Fy_pure, Fz_t, mu_x, mu_y)
 
 
         # To numpy for plotting
-        Fx_np = Fx_c.detach().cpu().numpy()
-        Fy_np = Fy_c.detach().cpu().numpy()
+        Fx_np = np.asarray(Fx_c)
+        Fy_np = np.asarray(Fy_c)
 
         ax.plot(Fx_np, Fy_np, label=f"{deg}° 椭圆")
 

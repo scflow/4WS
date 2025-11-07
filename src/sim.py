@@ -6,7 +6,6 @@ from .params import VehicleParams
 from .model import SimState, Control, TrackSettings
 from .twodof import derivatives as deriv_2dof
 from .dof_utils import body_to_world_2dof, body_to_world_3dof, curvature_4ws
-# from .mpc import solve_mpc_2dof, linearize_2dof
 from .mpc import solve_mpc_kin_dyn_4dof
 from .threedof import (
     Vehicle3DOF,
@@ -16,6 +15,7 @@ from .threedof import (
 )
 from .planner import plan_quintic_xy
 from .strategy import ideal_yaw_rate
+from .mppi_iface import MPPIController4WS
 
 class SimEngine:
     """后端仿真引擎：维护状态、轨迹与控制，并在后台线程中积分。"""
@@ -623,10 +623,9 @@ class SimEngine:
         if not (self.autop_enabled and len(self.plan) > 0):
             return
 
-        # 延迟初始化控制器
+        # 初始化控制器
         if not hasattr(self, '_mppi_ctrl') or self._mppi_ctrl is None:
             try:
-                from .mppi_iface import MPPIController4WS
                 self._mppi_ctrl = MPPIController4WS(
                     params=self.params,
                     dt=self.dt,
@@ -638,27 +637,11 @@ class SimEngine:
                     delta_rate_frac=float(self.delta_rate_frac),
                 )
             except Exception:
-                # MPS/CUDA 初始化失败时，回退到 CPU 再试
                 try:
-                    self._mppi_ctrl = MPPIController4WS(
-                        params=self.params,
-                        dt=self.dt,
-                        plan_provider=lambda: self.plan,
-                        delta_max=float(self.delta_max),
-                        dU_max=float(self.dU_max),
-                        U_max=float(self.U_max),
-                        device='cpu',
-                        model_type=('3dof' if self.mode == '3dof' else '2dof'),
-                        delta_rate_frac=float(self.delta_rate_frac),
-                    )
-                except Exception as e:
-                    print(f"[SimEngine] MPPI 初始化失败（含 CPU 回退）: {e}. 使用几何型 3DOF 回退。")
-                    # 初始化阶段也失败：执行 3DOF 几何回退，保持控制更新
-                    try:
-                        self._fallback_geom_3dof()
-                    except Exception as e_fb:
-                        print(f"[SimEngine] 3DOF 几何回退失败: {e_fb}")
-                    return
+                    self._fallback_geom_3dof()
+                except Exception as e_fb:
+                    print(f"[SimEngine] 3DOF 几何回退失败: {e_fb}")
+                return
             # 传递牵引分配与速度控制增益到控制器（3DOF 使用）
             try:
                 self._mppi_ctrl.drive_bias_front = float(self.drive_bias_front)
@@ -703,39 +686,12 @@ class SimEngine:
             u_np = self._mppi_ctrl.command(s_np)
         except Exception as e:
             # 运行期失败时：记录错误并尝试切换到 CPU 设备后重试
-            print(f"[SimEngine] MPPI.command 失败: {e}. 尝试切换到 CPU 回退。")
+            print(f"[SimEngine] MPPI.command 失败: {e}。改用几何型 3DOF 回退。")
             try:
-                ctrl_dev = str(getattr(self._mppi_ctrl, 'device', 'cpu')).lower()
-                if ctrl_dev != 'cpu':
-                    from .mppi_iface import MPPIController4WS
-                    self._mppi_ctrl = MPPIController4WS(
-                        params=self.params,
-                        dt=self.dt,
-                        plan_provider=lambda: self.plan,
-                        delta_max=float(self.delta_max),
-                        dU_max=float(self.dU_max),
-                        U_max=float(self.U_max),
-                        device='cpu',
-                        model_type=('3dof' if self.mode == '3dof' else '2dof'),
-                        delta_rate_frac=float(self.delta_rate_frac),
-                    )
-                    u_np = self._mppi_ctrl.command(s_np)
-                else:
-                    # 已在 CPU 上仍失败：执行 3DOF 几何回退，避免控制停滞
-                    print("[SimEngine] MPPI 在 CPU 上仍失败，改用几何型 3DOF 回退。")
-                    try:
-                        self._fallback_geom_3dof()
-                    except Exception as e_fb:
-                        print(f"[SimEngine] 3DOF 几何回退失败: {e_fb}")
-                    return
-            except Exception as e2:
-                print(f"[SimEngine] MPPI CPU 回退也失败: {e2}")
-                # 再次失败：执行 3DOF 几何回退（保持控制更新）
-                try:
-                    self._fallback_geom_3dof()
-                except Exception as e_fb:
-                    print(f"[SimEngine] 3DOF 几何回退失败: {e_fb}")
-                return
+                self._fallback_geom_3dof()
+            except Exception as e_fb:
+                print(f"[SimEngine] 3DOF 几何回退失败: {e_fb}")
+            return
         d_df_cmd, d_dr_cmd, dU_cmd = float(u_np[0]), float(u_np[1]), float(u_np[2])
         # 正常得到 MPPI 指令：清除几何回退标记并更新类型
         self._geom_fallback_active = False

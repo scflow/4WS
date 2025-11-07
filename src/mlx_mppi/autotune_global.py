@@ -1,12 +1,10 @@
 import abc
-import numpy as np
-import torch.cuda
-
-# pip install "ray[tune]" bayesian-optimization hyperopt
+import math
+import mlx.core as mx
 from ray import tune
 from ray import train
 
-from pytorch_mppi import autotune
+from . import autotune
 from ray.tune.search.hyperopt import HyperOptSearch
 
 
@@ -30,8 +28,8 @@ class GlobalTunableParameter(autotune.TunableParameter, abc.ABC):
         # tune doesn't have public API for type checking samplers
         sampler = space.get_sampler()
         if hasattr(sampler, 'base'):
-            b = np.log(sampler.base)
-            return np.log(space.lower) / b, np.log(space.upper) / b
+            b = math.log(sampler.base)
+            return math.log(space.lower) / b, math.log(space.upper) / b
         return space.lower, space.upper
 
     @staticmethod
@@ -40,11 +38,11 @@ class GlobalTunableParameter(autotune.TunableParameter, abc.ABC):
         sampler = space.get_sampler()
         # log
         if hasattr(sampler, 'base'):
-            b = np.log(sampler.base)
-            return np.log(v) / b
+            b = math.log(sampler.base)
+            return math.log(v) / b
         # quantized
         if hasattr(sampler, 'q'):
-            return np.round(np.divide(v, sampler.q)) * sampler.q
+            return round(v / sampler.q) * sampler.q
         return v
 
 
@@ -100,7 +98,8 @@ class AutotuneGlobal(autotune.Autotune):
         for p in self.params:
             assert isinstance(p, GlobalTunableParameter)
             v.extend(p.get_linearized_search_space_value(param_values))
-        return np.array(v)
+        # Return a plain Python list to avoid NumPy dependency.
+        return v
 
     def initial_value(self):
         init = {}
@@ -127,7 +126,7 @@ class RayOptimizer(autotune.Optimizer):
 
         hyperopt_search = self.search_alg(points_to_evaluate=[init], metric="cost", mode="min")
 
-        trainable_with_resources = tune.with_resources(self.trainable, {"gpu": 1 if torch.cuda.is_available() else 0})
+        trainable_with_resources = tune.with_resources(self.trainable, {"cpu": 1})
         self.optim = tune.Tuner(
             trainable_with_resources,
             tune_config=tune.TuneConfig(
@@ -143,7 +142,9 @@ class RayOptimizer(autotune.Optimizer):
         self.tuner.attach_parameters()
         self.tuner.apply_parameters(self.tuner.config_to_params(config))
         res = self.tuner.evaluate_fn()
-        train.report({'cost': res.costs.mean().item()})
+        # Compute mean cost using MLX (avoid NumPy/Torch dependencies).
+        mean_cost = float(mx.mean(mx.array(res.costs)))
+        train.report({'cost': mean_cost})
 
     def optimize_step(self):
         raise RuntimeError("Ray optimizers only allow tuning of all iterations at once")

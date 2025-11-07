@@ -426,14 +426,14 @@ def api_autop():
                 dev_active = True
             if dev is None:
                 try:
-                    import torch  # type: ignore
+                    import mlx.core as mx  # type: ignore
                     try:
-                        mps_available = hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()
+                        _ = mx.zeros(1, device=mx.gpu)
+                        dev = 'mps'
                     except Exception:
-                        mps_available = False
-                    dev = 'mps' if mps_available else ('cuda' if torch.cuda.is_available() else 'cpu')
+                        dev = 'cpu'
                 except Exception:
-                    dev = 'cpu'
+                    dev = 'cpu' 
         except Exception:
             if dev is None:
                 dev = 'cpu'
@@ -468,12 +468,12 @@ def api_autop():
             dev_active = True
         if dev is None:
             try:
-                import torch  # type: ignore
+                import mlx.core as mx  # type: ignore
                 try:
-                    mps_available = hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()
+                    _ = mx.zeros(1, device=mx.gpu)
+                    dev = 'mps'
                 except Exception:
-                    mps_available = False
-                dev = 'mps' if mps_available else ('cuda' if torch.cuda.is_available() else 'cpu')
+                    dev = 'cpu'
             except Exception:
                 dev = 'cpu'
     except Exception:
