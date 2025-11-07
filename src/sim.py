@@ -2,6 +2,7 @@ import threading
 import time
 from typing import List, Dict, Literal
 import numpy as np
+import mlx.core as mx
 from .params import VehicleParams
 from .model import SimState, Control, TrackSettings
 from .twodof import derivatives as deriv_2dof
@@ -653,7 +654,7 @@ class SimEngine:
         # 当前状态按模式打包为 s
         if self.mode == '2dof':
             # s = [x, y, psi, beta, r, U, df, dr]
-            s_np = np.array([
+            s_mx = mx.array([
                 float(self.state2.x),
                 float(self.state2.y),
                 float(self.state2.psi),
@@ -662,14 +663,14 @@ class SimEngine:
                 float(self.ctrl.U),
                 float(self.ctrl.delta_f),
                 float(self.ctrl.delta_r),
-            ], dtype=float)
+            ], dtype=mx.float32)
         else:
             # s = [vx, vy, r, x, y, psi, U_cmd, df, dr]
             # 使用当前 3DOF 速度与位置；U_cmd 采用控制模块中的速度指令
             # 若尚未进入 3DOF 状态，可做保守初始化
             vx = float(getattr(self.state3, 'vx', self.params.U_eff()))
             vy = float(getattr(self.state3, 'vy', 0.0))
-            s_np = np.array([
+            s_mx = mx.array([
                 vx,
                 vy,
                 float(getattr(self.state3, 'r', self.state2.r)),
@@ -679,11 +680,11 @@ class SimEngine:
                 float(self.ctrl.U),
                 float(self.ctrl.delta_f),
                 float(self.ctrl.delta_r),
-            ], dtype=float)
+            ], dtype=mx.float32)
 
         # 求解控制动作 u = [d_delta_f, d_delta_r, dU]
         try:
-            u_np = self._mppi_ctrl.command(s_np)
+            u_np = self._mppi_ctrl.command(s_mx)
         except Exception as e:
             # 运行期失败时：记录错误并尝试切换到 CPU 设备后重试
             print(f"[SimEngine] MPPI.command 失败: {e}。改用几何型 3DOF 回退。")

@@ -11,8 +11,6 @@ def handle_batch_input(n: int = 2):
         return wrapped
     return deco
 
-logger = logging.getLogger(__name__)
-
 
 def _ensure_non_zero(cost, beta, factor):
     return mx.exp(-factor * (cost - beta))
@@ -343,6 +341,7 @@ class MPPI():
             next_state = self.specific_action_sampler.specific_dynamics(next_state, state, u, t)
         return next_state
 
+    # @mx.compile
     def _compute_total_cost_batch(self):
         self._compute_perturbed_action_and_noise()
         if self.noise_abs_cost:
@@ -648,7 +647,6 @@ def run_mppi(mppi, env, retrain_dynamics, retrain_after_iter=50, iter=1000, rend
             res = env.step(action.tolist())
         s, r = res[0], res[1]
         total_reward += float(r)
-        logger.debug("action taken: %.4f cost received: %.4f time taken: %.5fs", float(mx.sum(action)), -float(r), elapsed)
         if render:
             env.render()
 

@@ -27,7 +27,7 @@ class MPPIController4WS:
         model_type: str = '2dof',
         num_samples: int = 16,
         horizon: int = 30,
-        lambda_: float = 30.0,
+        lambda_: float = 12.0,
         delta_rate_frac: float = 0.5,
     ):
         self.params = params
@@ -99,6 +99,25 @@ class MPPIController4WS:
 
         # 缓存上一时刻动作用于平滑代价
         self._last_u = None
+
+        # 3DOF 参数对象缓存，避免在核心动力学路径中重复创建
+        self._veh3_cached = None
+        if self.model_type == '3dof':
+            try:
+                self._veh3_cached = Vehicle3DOF(
+                    m=float(self.params.m),
+                    Iz=float(self.params.Iz),
+                    a=float(self.params.a),
+                    b=float(self.params.b),
+                    g=float(self.params.g),
+                    U_min=float(getattr(self.params, 'U_min', 0.5)),
+                    kf=float(self.params.kf),
+                    kr=float(self.params.kr),
+                    tire_model=str(getattr(self.params, 'tire_model', 'linear')),
+                )
+            except Exception:
+                # 若参数不完整，延迟到首次使用时构建
+                self._veh3_cached = None
 
     # --- 动力学：f(s, u) -> s_next ---
     def _dynamics(self, s: object, u: object) -> object:
@@ -180,8 +199,27 @@ class MPPIController4WS:
             # 3DOF 非线性动力学：使用速度指令（U_next）产生纵向驱动，耦合摩擦椭圆
             # 状态子向量为 [vx, vy, r, x, y, psi]
             s6 = mx.stack([vx, vy, r, x, y, psi], axis=-1)
+            # 使用缓存的 3DOF 参数对象，避免重复构造
+            veh3 = self._veh3_cached
+            if veh3 is None:
+                try:
+                    veh3 = Vehicle3DOF(
+                        m=float(self.params.m),
+                        Iz=float(self.params.Iz),
+                        a=float(self.params.a),
+                        b=float(self.params.b),
+                        g=float(self.params.g),
+                        U_min=float(getattr(self.params, 'U_min', 0.5)),
+                        kf=float(self.params.kf),
+                        kr=float(self.params.kr),
+                        tire_model=str(getattr(self.params, 'tire_model', 'linear')),
+                    )
+                    self._veh3_cached = veh3
+                except Exception:
+                    # 保底：若构造失败，则抛回原函数处理异常
+                    pass
             ds, _aux = derivatives_speed_cmd_mlx(
-                s6, df_next, dr_next, Vehicle3DOF(
+                s6, df_next, dr_next, veh3 if veh3 is not None else Vehicle3DOF(
                     m=float(self.params.m),
                     Iz=float(self.params.Iz),
                     a=float(self.params.a),
@@ -260,11 +298,28 @@ class MPPIController4WS:
             U_mag_vec = mx.sqrt(mx.maximum(vx_vec * vx_vec + vy_vec * vy_vec, 1e-12))
 
         # 计划几何缓存与向量化误差/曲率计算
-        # 缓存版本：使用长度与首尾坐标的简化签名
+        # 缓存键：长度 + 首尾坐标的量化版 + 轨迹总长（量化），避免微小抖动导致频繁失效
+        def _q(v):
+            try:
+                return float(np.round(float(v), 3))
+            except Exception:
+                return 0.0
         try:
             first = plan[0]
             last = plan[-1]
-            plan_version = (len(plan), float(first.get('x', 0.0)), float(first.get('y', 0.0)), float(last.get('x', 0.0)), float(last.get('y', 0.0)))
+            # 计算量化的轨迹总长
+            try:
+                coords_np = np.array([[float(p['x']), float(p['y'])] for p in plan], dtype=np.float32)
+                segs = coords_np[1:] - coords_np[:-1]
+                total_len_q = float(np.round(np.sum(np.sqrt(np.sum(segs * segs, axis=1))), 2))
+            except Exception:
+                total_len_q = 0.0
+            plan_version = (
+                len(plan),
+                _q(first.get('x', 0.0)), _q(first.get('y', 0.0)),
+                _q(last.get('x', 0.0)), _q(last.get('y', 0.0)),
+                total_len_q,
+            )
         except Exception:
             plan_version = (len(plan),)
         if not hasattr(self, '_plan_cache'):
@@ -420,7 +475,11 @@ class MPPIController4WS:
         return mx.reshape(cost, batch_dims)
 
     def command(self, s_arr: object) -> object:
-        s = mx.array(s_arr, dtype=mx.float32)
+        # 若已是 MLX 张量则直接使用，避免重复转换；否则转换为 MLX
+        if hasattr(s_arr, 'shape') and not isinstance(s_arr, np.ndarray):
+            s = s_arr
+        else:
+            s = mx.array(s_arr, dtype=mx.float32)
         u = self.mppi.command(s)
         # 缓存上一动作（保持数组即可）
         self._last_u = u

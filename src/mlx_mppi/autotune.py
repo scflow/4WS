@@ -2,18 +2,13 @@ import logging
 import abc
 import typing
 import random
-
 import mlx.core as mx
+from .mppi import MPPI
+import cma
+
 
 def ensure_array(dtype, value):
     return mx.array(value, dtype=dtype if dtype is not None else mx.float32)
-
-from .mppi import MPPI
-# optimizers
-import cma
-
-logger = logging.getLogger(__file__)
-
 
 class EvaluationResult(typing.NamedTuple):
     # (N) cost for each trajectory evaluated
@@ -301,7 +296,6 @@ class Autotune:
         # 复制参数值以免外部修改影响记录
         copied = {k: (v.copy() if hasattr(v, 'copy') else v) for k, v in kv.items()}
         res = res._replace(iteration=iteration, params=copied)
-        logger.info(f"i:{iteration} cost: {float(mx.mean(mx.array(res.costs)))} params:{kv}")
         self.results.append(res)
         return res
 
