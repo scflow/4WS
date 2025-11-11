@@ -2,7 +2,6 @@ import numpy as np
 from typing import List, Dict, Tuple, Optional
 from .twodof import derivatives as deriv_2dof
 
-# --- 旧的 2-DOF 函数 (保留) ---
 
 def nearest_plan_index(plan: List[Dict[str, float]], x: float, y: float) -> int:
     """在参考轨迹中寻找与 (x,y) 最近的点索引。"""
