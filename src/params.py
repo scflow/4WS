@@ -31,7 +31,7 @@ class VehicleParams:
     U: float = 20.0
     mu: float = 0.85
     g: float = 9.81
-    U_min: float = 1e-3
+    U_min: float = 0.3
     # 低速融合阈值：当 |U| < U_blend 时，逐渐转为几何模型以稳定数值
     U_blend: float = 0.3
     # 轮胎模型选择：'pacejka'（魔术方程）或 'linear'（线性侧偏刚度）

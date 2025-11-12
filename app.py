@@ -169,6 +169,12 @@ def api_telemetry():
         # 备用：提供实际速度与半径，便于分析（列不强制）
         'speed': float(st.get('speed', ct.get('U', 0.0))),
         'radius': st.get('radius') if st.get('radius') is not None else None,
+        # 性能：自动控制段耗时、循环耗时与睡眠、实际频率与目标 dt
+        'autop_ms': float(getattr(ENGINE, '_last_autop_ms', 0.0)),
+        'loop_ms': float(getattr(ENGINE, '_last_loop_ms', 0.0)),
+        'sleep_ms': float(getattr(ENGINE, '_last_sleep_ms', 0.0)),
+        'tick_hz': float(getattr(ENGINE, '_last_tick_hz', 0.0)),
+        'dt_cfg': float(getattr(ENGINE, 'dt', 0.0)),
     })
 
 # 控制量查询/更新（U, df, dr, running）
@@ -408,6 +414,65 @@ def api_plan_circle():
     plan = plan_circle_arc(start, end, T, N, U_start=float(VP.U))
     ENGINE.load_plan(plan)
     return jsonify({'ok': True, 'N': N, 'count': len(plan)})
+
+@app.route('/api/plan/import', methods=['POST'])
+def api_plan_import():
+    data = request.get_json(force=True) or {}
+    pts = data.get('points')
+    if not isinstance(pts, list):
+        return jsonify({'error': 'points must be array'}), 400
+    n = len(pts)
+    if n < 2:
+        return jsonify({'error': 'points length must be >= 2'}), 400
+    if n > 5000:
+        return jsonify({'error': 'points length too large'}), 400
+
+    def _wrap(a: float) -> float:
+        return float((a + np.pi) % (2.0 * np.pi) - np.pi)
+
+    out = []
+    for i in range(n):
+        p = pts[i] if isinstance(pts[i], dict) else {}
+        try:
+            x = float(p.get('x'))
+            y = float(p.get('y'))
+        except (TypeError, ValueError):
+            return jsonify({'error': f'invalid x/y at index {i}'}), 400
+        t_raw = p.get('t', None)
+        psi_raw = p.get('psi', None)
+        t_val = None
+        psi_val = None
+        try:
+            if t_raw is not None:
+                t_val = float(t_raw)
+        except (TypeError, ValueError):
+            return jsonify({'error': f'invalid t at index {i}'}), 400
+        try:
+            if psi_raw is not None:
+                psi_val = _wrap(float(psi_raw))
+        except (TypeError, ValueError):
+            return jsonify({'error': f'invalid psi at index {i}'}), 400
+        out.append({'t': (t_val if t_val is not None else 0.0), 'x': x, 'y': y, 'psi': (psi_val if psi_val is not None else 0.0)})
+
+    for i in range(n):
+        if not np.isfinite(out[i]['psi']):
+            out[i]['psi'] = 0.0
+    for i in range(n):
+        if 'psi' in out[i] and out[i]['psi'] != 0.0:
+            continue
+        j = i + 1 if i + 1 < n else (i - 1 if i - 1 >= 0 else i)
+        dx = out[j]['x'] - out[i]['x']
+        dy = out[j]['y'] - out[i]['y']
+        if abs(dx) < 1e-9 and abs(dy) < 1e-9:
+            if i > 0:
+                out[i]['psi'] = out[i - 1]['psi']
+            else:
+                out[i]['psi'] = 0.0
+        else:
+            out[i]['psi'] = _wrap(float(np.arctan2(dy, dx)))
+
+    ENGINE.load_plan(out)
+    return jsonify({'ok': True, 'count': len(out)})
 
 # 自动跟踪开关/查询（根据参考轨迹沿路输出前后轮角）
 @app.route('/api/autop', methods=['GET', 'POST'])

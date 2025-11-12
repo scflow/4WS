@@ -34,6 +34,7 @@
         <div class="conn-indicator"><span id="conn_dot" class="conn-dot"></span><span class="conn-label">Flask</span></div>
         <div class="conn-indicator"><span id="dev_dot" class="conn-dot"></span><span id="dev_label" class="conn-label">N/A</span></div>
         <div class="conn-indicator"><span id="ctl_dot" class="conn-dot"></span><span id="ctl_label" class="conn-label">N/A</span></div>
+        <div class="conn-indicator"><span class="conn-label">控制</span><span id="perf_autop_ms" class="conn-label">— ms</span><span class="conn-label">Tick</span><span id="perf_tick_hz" class="conn-label">— Hz</span></div>
       </div>
     </header>
 
@@ -97,6 +98,8 @@
           <button id="plan_only" class="btn ok">规划</button>
           <button id="autop_start" class="btn ok">开始自动跟踪</button>
           <button id="export_plan" class="btn">导出规划 CSV</button>
+          <input id="import_plan_file" type="file" accept=".csv" style="display:none" />
+          <button id="import_plan" class="btn">导入规划 CSV</button>
         </div>
       </section>
 
@@ -152,6 +155,8 @@
           <div><span>R:</span> <strong id="stat_R">—</strong> m</div>
           <div><span>δḟ:</span> <strong id="stat_df_dot">0.0</strong> deg/s</div>
           <div><span>δṙ:</span> <strong id="stat_dr_dot">0.0</strong> deg/s</div>
+          <div><span>步时:</span> <strong id="stat_step_ms">—</strong> ms</div>
+          <div><span>频率:</span> <strong id="stat_tick_hz">—</strong> Hz</div>
         </div>
 
         <h3 class="sub">车辆参数</h3>

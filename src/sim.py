@@ -59,10 +59,14 @@ class SimEngine:
         self._df_dot = 0.0
         self._dr_dot = 0.0
         self._speed = float(self.params.U)
-        self._radius: float | None = None
+        self._radius = None
         # 导数采样：beta_dot 与 r_dot（用于前端导出 CSV）
         self._beta_dot = 0.0
         self._r_dot = 0.0
+        self._last_autop_ms = 0.0
+        self._last_loop_ms = 0.0
+        self._last_sleep_ms = 0.0
+        self._last_tick_hz = 0.0
 
         # 牵引分配：后轴为主；按转角对齐车体轴衰减前轴扭矩（减小纵向致转力矩并保留侧向容量）
         self.drive_bias_front = 0.1        # 前轴基础牵引比例
@@ -79,7 +83,7 @@ class SimEngine:
         self.controller_type: Literal['simple', 'mpc', 'mppi', 'geometric', 'manual'] = 'manual'
         self._geom_fallback_active: bool = False
         # 目标位姿与重规划开关
-        self.goal_pose_end: Dict[str, float] | None = None
+        self.goal_pose_end = None
         self.replan_every_step: bool = False
         # 纯追踪/几何参考的预瞄距离参数（可前端/配置调整）
         self.Ld_k = 0.8                 # 预瞄距离线性系数：Ld = k*U + b
@@ -104,6 +108,10 @@ class SimEngine:
             # 控制节拍：尽量与 dt 接近
             spent = time.perf_counter() - start
             sleep = max(0.0, self.dt - spent)
+            self._last_loop_ms = float(spent * 1000.0)
+            self._last_sleep_ms = float(sleep * 1000.0)
+            cyc = max(self.dt, spent + sleep)
+            self._last_tick_hz = float(1.0 / max(1e-9, cyc))
             time.sleep(sleep)
 
     # 单步积分
@@ -113,6 +121,7 @@ class SimEngine:
 
         # 自动跟踪：在积分前根据参考轨迹更新 df/dr（支持 2DOF）
         if self.autop_enabled and len(self.plan) > 0:
+            t0_autop = time.perf_counter()
             # 若启用每步重规划，则先根据当前状态与目标位姿重算参考轨迹
             if self.replan_every_step:
                 try:
@@ -125,6 +134,7 @@ class SimEngine:
                 self._autop_update_mppi()
             elif self.mode == '2dof':
                 self._autop_update_simple()
+            self._last_autop_ms = float((time.perf_counter() - t0_autop) * 1000.0)
 
         # 模式分支：2DOF 线性 或 3DOF 非线性
         if self.mode == '2dof':
@@ -750,7 +760,7 @@ class SimEngine:
         self.ctrl.delta_r = dr_next
         self.ctrl.U = U_next
 
-    def _linearize_2dof(self, x_vec: np.ndarray, df0: float, dr0: float) -> tuple[np.ndarray, np.ndarray]:
+    def _linearize_2dof(self, x_vec: np.ndarray, df0: float, dr0: float):
         """数值线性化 2DOF：xdot ≈ A x + B u，返回 A(2x2), B(2x2)。"""
         base = deriv_2dof(x_vec, df0, dr0, self.params)
         xdot0 = np.array(base["xdot"], dtype=float)
@@ -888,7 +898,7 @@ class SimEngine:
                     self._sim_t = 0.0
         
 
-    def set_track_settings(self, enabled: bool | None = None, retention_sec: float | None = None, max_points: int | None = None):
+    def set_track_settings(self, enabled=None, retention_sec=None, max_points=None):
         with self._lock:
             if enabled is not None:
                 self.track_cfg.enabled = bool(enabled)

@@ -1,4 +1,3 @@
-// 简化版 MPPI 实现：Eigen + 可选 OpenMP 并行
 #include "mppi.hpp"
 #include <random>
 #ifdef _OPENMP

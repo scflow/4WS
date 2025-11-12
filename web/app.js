@@ -18,6 +18,7 @@ const trackCfg = { enabled: true, retentionSec: 30, maxPoints: 20000 };
 // 遥测缓冲与设置
 let telemetry = [];
 const telemetryCfg = { enabled: false, retentionSec: 30, timer: null };
+let lastPerf = null;
 // 到达终点检测与动画状态
 let arrived = false;
 let arriveTick = 0;
@@ -394,6 +395,8 @@ function bindUI() {
   // 规划时长 T 已移除，由后端自动估算
   const autopModeSel = document.getElementById('autop_mode_select');
   const exportPlanBtn = document.getElementById('export_plan');
+  const importPlanBtn = document.getElementById('import_plan');
+  const importPlanFile = document.getElementById('import_plan_file');
   // 初始化自动模式选择器与后端同步
   try {
     fetch('/api/autop', { cache: 'no-store' }).then(res => res.ok ? res.json() : null).then(data => {
@@ -479,6 +482,51 @@ function bindUI() {
   if (exportPlanBtn) {
     exportPlanBtn.addEventListener('click', () => { try { exportPlanCSV(); } catch (e) {} });
   }
+  if (importPlanBtn && importPlanFile) {
+    importPlanBtn.addEventListener('click', () => { importPlanFile.click(); });
+    importPlanFile.addEventListener('change', async () => {
+      const file = importPlanFile.files && importPlanFile.files[0];
+      if (!file) return;
+      try {
+        const text = await file.text();
+        const lines = text.split(/\r?\n/).map(s => s.trim()).filter(s => s.length > 0);
+        if (lines.length < 2) { alert('CSV 内容为空或不足'); return; }
+        const header = lines[0].split(',').map(s => s.trim());
+        const expect = ['t','x','y','psi'];
+        if (header.length !== expect.length || !header.every((h, i) => h === expect[i])) {
+          alert('CSV 表头必须为: t,x,y,psi'); return;
+        }
+        const points = [];
+        for (let i = 1; i < lines.length; i++) {
+          const cols = lines[i].split(',');
+          if (cols.length < 4) continue;
+          const t = cols[0].trim();
+          const x = cols[1].trim();
+          const y = cols[2].trim();
+          const psi = cols[3].trim();
+          const xv = Number(x); const yv = Number(y);
+          if (!Number.isFinite(xv) || !Number.isFinite(yv)) { alert(`第 ${i+1} 行 x/y 非数值`); return; }
+          const obj = { x: xv, y: yv };
+          if (t !== '') { const tv = Number(t); if (!Number.isFinite(tv)) { alert(`第 ${i+1} 行 t 非数值`); return; } obj.t = tv; }
+          if (psi !== '') { const pv = Number(psi); if (!Number.isFinite(pv)) { alert(`第 ${i+1} 行 psi 非数值`); return; } obj.psi = pv; }
+          points.push(obj);
+        }
+        if (points.length < 2) { alert('点数不足，至少需要 2 行数据'); return; }
+        const res = await fetch('/api/plan/import', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ points }) });
+        if (!res.ok) { const err = await res.json().catch(() => ({ error: '导入失败' })); alert(err.error || '导入失败'); return; }
+        await Promise.all([
+          fetch('/api/plan', { cache: 'no-store' }).then(r => r.ok ? r.json() : { points: [] }).then(d => { plan = Array.isArray(d.points) ? d.points : []; }),
+        ]);
+        view.follow = true; centerOnVehicle(); draw();
+        alert('导入成功');
+      } catch (e) {
+        console.warn('导入规划 CSV 失败', e);
+        alert('导入失败，请检查文件格式');
+      } finally {
+        importPlanFile.value = '';
+      }
+    });
+  }
 
   // 跟随与网格
   const followChk = document.getElementById('follow_mode');
@@ -547,6 +595,11 @@ function bindUI() {
         r_dot: Number(d.r_dot ?? 0),
         speed: Number(d.speed ?? (d.U ?? 0)),
         radius: (typeof d.radius === 'number') ? Number(d.radius) : null,
+        autop_ms: Number(d.autop_ms ?? 0),
+        loop_ms: Number(d.loop_ms ?? 0),
+        sleep_ms: Number(d.sleep_ms ?? 0),
+        tick_hz: Number(d.tick_hz ?? 0),
+        dt_cfg: Number(d.dt_cfg ?? 0),
       });
       // 保留最近时长
       const keepMs = telemetryCfg.retentionSec * 1000;
@@ -675,6 +728,10 @@ function bindUI() {
       safeSet(drInput, deg(ctrl.dr ?? 0).toFixed(1));
       // 同步模式与场景显示
       if (ctrl.mode && modeSel && document.activeElement !== modeSel) modeSel.value = ctrl.mode;
+      try {
+        const perfRes = await fetch('/api/telemetry', { cache: 'no-store' });
+        if (perfRes.ok) lastPerf = await perfRes.json();
+      } catch {}
       updateDashboard();
       if (view.follow) centerOnVehicle();
       // 到达终点判定与处理（触发一次）
@@ -736,7 +793,7 @@ function centerOnVehicle() {
 }
 
 // 仪表盘与派生量更新
-function updateDashboard() {
+  function updateDashboard() {
   document.getElementById('stat_x').textContent = state.x.toFixed(2);
   document.getElementById('stat_y').textContent = state.y.toFixed(2);
   document.getElementById('stat_psi').textContent = (state.psi * 180 / Math.PI).toFixed(2);
@@ -751,6 +808,19 @@ function updateDashboard() {
   const drDot = (typeof state.dr_dot === 'number') ? state.dr_dot : 0;
   document.getElementById('stat_df_dot').textContent = deg(dfDot).toFixed(1);
   document.getElementById('stat_dr_dot').textContent = deg(drDot).toFixed(1);
+  try {
+    const p = lastPerf || (telemetry.length > 0 ? telemetry[telemetry.length - 1] : null);
+    if (p) {
+      const autopEl = document.getElementById('perf_autop_ms');
+      const tickEl = document.getElementById('perf_tick_hz');
+      const stepEl = document.getElementById('stat_step_ms');
+      const hzEl = document.getElementById('stat_tick_hz');
+      if (autopEl) autopEl.textContent = `${(p.autop_ms || 0).toFixed(1)} ms`;
+      if (tickEl) tickEl.textContent = `${(p.tick_hz || 0).toFixed(1)} Hz`;
+      if (stepEl) stepEl.textContent = `${(p.loop_ms || 0).toFixed(2)}`;
+      if (hzEl) hzEl.textContent = `${(p.tick_hz || 0).toFixed(2)}`;
+    }
+  } catch {}
 }
 function updateDerivedStats() {
   // L 与 K 在后端计算亦可，这里简易前端计算与展示

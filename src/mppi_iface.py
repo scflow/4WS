@@ -33,9 +33,9 @@ class MPPIController4WS:
         U_max: float,
         model_type: str = '2dof',
         device: Optional[str] = None,
-        num_samples: int = 16,
+        num_samples: int = 256,
         horizon: int = 30,
-        lambda_: float = 30.0,
+        lambda_: float = 20.0,
         delta_rate_frac: float = 0.5,
     ):
         self.params = params
@@ -55,8 +55,8 @@ class MPPIController4WS:
             mps_available = False
         self.device = device or ('mps' if mps_available else ('cuda' if torch.cuda.is_available() else 'cpu'))
 
-        self.w_lat = 2000.0
-        self.w_head = 40000
+        self.w_lat = 20000
+        self.w_head = 400000
         # 直线速度激励（机会成本），弯道弱化
         self.w_speed = 10.0
         self.w_u = 1.0
@@ -74,9 +74,9 @@ class MPPIController4WS:
         # 曲率门控与蟹行/稳定性权重
         self.kappa_turn_k0 = 0.02   # 转弯门控起始阈值 [1/m]
         self.kappa_turn_k1 = 0.06   # 转弯门控满载阈值 [1/m]
-        self.w_yaw_track = 2400.0   # 强制 r ≈ U*kappa_ref
-        self.w_crab = 220.0         # 弯道蟹行抑制 (df+dr)^2
-        self.w_ay = 120.0           # 弯道横向加速度代价 ay^2
+        self.w_yaw_track = 240.0   # 强制 r ≈ U*kappa_ref
+        self.w_crab = 22.0         # 弯道蟹行抑制 (df+dr)^2
+        self.w_ay = 12.0           # 弯道横向加速度代价 ay^2
         self.w_beta = 10.0          # 弯道侧偏角代价 beta^2
         self.w_dU_turn = 1.2        # 弯道加速变化惩罚 dU^2
         self.k_max = 0.8            # 弯道相位比例的最大反相幅度
@@ -256,176 +256,145 @@ class MPPIController4WS:
 
     # --- 成本函数：l(s, u) ---
     def _running_cost(self, s: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
-        # 取参考路径
         plan = self.plan_provider() or []
         if len(plan) < 2:
-            # 无参考时仅使用动作与速度代价
             return self.w_u * torch.sum(u * u, dim=-1)
 
-        # 支持单样本和批量
         single = False
         if s.ndim == 1:
             s = s.unsqueeze(0)
             u = u.unsqueeze(0)
             single = True
 
-        # 提取状态：按模型类型区分
+        dtype = s.dtype
+        device = s.device
+
+        px_t = torch.tensor([p['x'] for p in plan], dtype=dtype, device=device)
+        py_t = torch.tensor([p['y'] for p in plan], dtype=dtype, device=device)
+        dx_seg = px_t[1:] - px_t[:-1]
+        dy_seg = py_t[1:] - py_t[:-1]
+        seg_psi_t = torch.atan2(dy_seg, torch.clamp(dx_seg, min=1e-12))
+
         if self.model_type == '2dof':
-            x = s[..., 0].detach().cpu().numpy()
-            y = s[..., 1].detach().cpu().numpy()
-            psi = s[..., 2].detach().cpu().numpy()
-            U_mag_np = s[..., 5].detach().cpu().numpy()
+            x = s[..., 0]
+            y = s[..., 1]
+            psi_t = s[..., 2]
+            U_mag_t = s[..., 5]
         else:
-            # 3DOF：速度幅值由 vx,vy 计算
-            vx_np = s[..., 0].detach().cpu().numpy()
-            vy_np = s[..., 1].detach().cpu().numpy()
-            x = s[..., 3].detach().cpu().numpy()
-            y = s[..., 4].detach().cpu().numpy()
-            psi = s[..., 5].detach().cpu().numpy()
-            U_mag_np = (vx_np**2 + vy_np**2)**0.5
+            vx = s[..., 0]
+            vy = s[..., 1]
+            x = s[..., 3]
+            y = s[..., 4]
+            psi_t = s[..., 5]
+            U_mag_t = torch.sqrt(torch.clamp(vx * vx + vy * vy, min=1e-12))
 
-        # 参考数组
-        px = np.array([p['x'] for p in plan], dtype=float)
-        py = np.array([p['y'] for p in plan], dtype=float)
-        # 段航向与曲率（近似）
-        dpx = np.diff(px)
-        dpy = np.diff(py)
-        seg_psi = np.arctan2(dpy, dpx + 1e-12)
+        K = px_t.shape[0]
+        dist2 = (x.unsqueeze(1) - px_t.unsqueeze(0)) ** 2 + (y.unsqueeze(1) - py_t.unsqueeze(0)) ** 2
+        j = torch.argmin(dist2, dim=1)
+        j = torch.clamp(j, min=0, max=K - 2)
 
-        # 逐样本误差
-        e_y_list, e_psi_list, kappa_ref_list, U_des_list = [], [], [], []
-        for i in range(x.shape[0]):
-            # 最近点索引（按点距离）
-            di = np.argmin((px - x[i])**2 + (py - y[i])**2)
-            j = int(np.clip(di, 0, len(seg_psi) - 1))
-            dx = px[j+1] - px[j]
-            dy = py[j+1] - py[j]
-            ds = float(np.hypot(dx, dy))
-            psi_base = float(seg_psi[j])
-            ex = float(x[i] - px[j])
-            ey = float(y[i] - py[j])
-            e_y = float(-ex * np.sin(psi_base) + ey * np.cos(psi_base))
-            # e_psi = 参考 - 当前
-            dpsi = psi_base - float(psi[i])
-            # wrap 到 [-pi, pi]
-            dpsi = (dpsi + np.pi) % (2*np.pi) - np.pi
-            e_psi = float(dpsi)
+        psi_base = seg_psi_t[j]
+        ex = x - px_t[j]
+        ey = y - py_t[j]
+        e_y_t = -ex * torch.sin(psi_base) + ey * torch.cos(psi_base)
+        dpsi = psi_base - psi_t
+        e_psi_t = torch.atan2(torch.sin(dpsi), torch.cos(dpsi))
 
-            # 曲率参考（两段平均）
-            j_prev = max(0, j-1)
-            j_next = min(len(seg_psi)-1, j+1)
-            dpsi_seg = (seg_psi[j_next] - seg_psi[j_prev] + np.pi) % (2*np.pi) - np.pi
-            ds_a = float(np.hypot(px[j_prev+1]-px[j_prev], py[j_prev+1]-py[j_prev])) if j_prev+1 < len(px) else ds
-            ds_b = float(np.hypot(px[j_next+1]-px[j_next], py[j_next+1]-py[j_next])) if j_next+1 < len(px) else ds
-            ds_avg = max(1e-6, 0.5*(ds_a+ds_b))
-            kappa_ref = float(dpsi_seg / ds_avg)
-
-            # 速度期望（横向加速度约束近似）
-            ay_limit = float(getattr(self.params, 'mu', 1.0) * getattr(self.params, 'g', 9.81)) * float(getattr(self, 'ay_limit_coeff', 0.85))
-            U_des = float(np.sqrt(max(0.0, ay_limit / max(1e-6, abs(kappa_ref))))) if abs(kappa_ref) > 1e-6 else float(getattr(self.params, 'U', U[i]))
-
-            e_y_list.append(e_y)
-            e_psi_list.append(e_psi)
-            kappa_ref_list.append(kappa_ref)
-            U_des_list.append(U_des)
-
-        e_y_t = torch.tensor(e_y_list, dtype=s.dtype, device=s.device)
-        e_psi_t = torch.tensor(e_psi_list, dtype=s.dtype, device=s.device)
-        U_des_t = torch.tensor(U_des_list, dtype=s.dtype, device=s.device)
-
-        # 曲率与门控（使用有符号曲率以约束方向一致性）
-        if self.model_type == '2dof':
-            kappa_cur_signed = s[..., 4] / torch.clamp(s[..., 5], min=1e-6)
-        else:
-            U_mag_t = torch.sqrt(torch.clamp(s[..., 0] * s[..., 0] + s[..., 1] * s[..., 1], min=1e-12))
-            kappa_cur_signed = s[..., 2] / torch.clamp(U_mag_t, min=1e-6)
-        kappa_ref_t_signed = torch.tensor(kappa_ref_list, dtype=s.dtype, device=s.device)
+        j_prev = torch.clamp(j - 1, min=0, max=K - 2)
+        j_next = torch.clamp(j + 1, min=0, max=K - 2)
+        dpsi_seg = seg_psi_t[j_next] - seg_psi_t[j_prev]
+        dpsi_seg_wrapped = torch.atan2(torch.sin(dpsi_seg), torch.cos(dpsi_seg))
+        dx_prev = px_t[j_prev + 1] - px_t[j_prev]
+        dy_prev = py_t[j_prev + 1] - py_t[j_prev]
+        ds_a = torch.sqrt(dx_prev * dx_prev + dy_prev * dy_prev)
+        dx_next = px_t[j_next + 1] - px_t[j_next]
+        dy_next = py_t[j_next + 1] - py_t[j_next]
+        ds_b = torch.sqrt(dx_next * dx_next + dy_next * dy_next)
+        ds_avg = torch.clamp(0.5 * (ds_a + ds_b), min=1e-6)
+        kappa_ref_t_signed = dpsi_seg_wrapped / ds_avg
         kappa_ref_mag = torch.abs(kappa_ref_t_signed)
-        # 曲率门控：在 |kappa_ref| 较大时增强转弯相关惩罚
         G_turn = torch.clamp((kappa_ref_mag - self.kappa_turn_k0) / (self.kappa_turn_k1 - self.kappa_turn_k0 + 1e-9), 0.0, 1.0)
         G_straight = 1.0 - 0.7 * G_turn
 
-        # 基础几何跟踪
         cost = (
             self.w_lat * (e_y_t ** 2) +
             self.w_head * (e_psi_t ** 2) +
             self.w_u * torch.sum(u * u, dim=-1)
         )
 
-        # Yaw 跟踪：强制 r ≈ U * kappa_ref（方向与幅值一致）
         if self.model_type == '2dof':
             yaw_track_err = s[..., 4] - s[..., 5] * kappa_ref_t_signed
         else:
-            U_mag_t = torch.sqrt(torch.clamp(s[..., 0] * s[..., 0] + s[..., 1] * s[..., 1], min=1e-12))
             yaw_track_err = s[..., 2] - U_mag_t * kappa_ref_t_signed
         cost = cost + self.w_yaw_track * (yaw_track_err ** 2)
 
-        # 直线速度激励（机会成本），在转弯段弱化
+        U_max_t = torch.tensor(self.U_max, dtype=dtype, device=device)
         if self.model_type == '2dof':
-            speed_shortfall = torch.clamp(torch.tensor(self.U_max, dtype=s.dtype, device=s.device) - s[..., 5], min=0.0)
+            speed_shortfall = torch.clamp(U_max_t - s[..., 5], min=0.0)
         else:
-            U_mag_t = torch.sqrt(torch.clamp(s[..., 0] * s[..., 0] + s[..., 1] * s[..., 1], min=1e-12))
-            speed_shortfall = torch.clamp(torch.tensor(self.U_max, dtype=s.dtype, device=s.device) - U_mag_t, min=0.0)
+            speed_shortfall = torch.clamp(U_max_t - U_mag_t, min=0.0)
         cost = cost + self.w_speed * speed_shortfall * G_straight
 
-        # 稳定性与蟹行抑制（随转弯门控增强）
         if self.model_type == '2dof':
             df_t = s[..., 6]
             dr_t = s[..., 7]
+            kappa_cur_signed = s[..., 4] / torch.clamp(s[..., 5], min=1e-6)
             ay_approx = (s[..., 5] ** 2) * torch.abs(kappa_cur_signed)
             beta_t = s[..., 3]
         else:
             df_t = s[..., 7]
             dr_t = s[..., 8]
-            # U_mag 近似横向加速度：U^2 * |kappa|
-            U_mag_t = torch.sqrt(torch.clamp(s[..., 0] * s[..., 0] + s[..., 1] * s[..., 1], min=1e-12))
+            kappa_cur_signed = s[..., 2] / torch.clamp(U_mag_t, min=0.3)
             ay_approx = (U_mag_t ** 2) * torch.abs(kappa_cur_signed)
             beta_t = torch.atan2(s[..., 1], torch.clamp(s[..., 0], min=1e-6))
         cost = cost + self.w_ay * (ay_approx ** 2) * G_turn
         cost = cost + self.w_beta * (beta_t ** 2) * (0.5 + 0.5 * G_turn)
-        # 直接抑制同向同角（df+dr）
         cost = cost + self.w_crab * ((df_t + dr_t) ** 2) * G_turn
 
-        # 前后轮相位约束：低速鼓励反相，高速弱同相
-        U_t = s[..., 5] if self.model_type == '2dof' else torch.sqrt(torch.clamp(s[..., 0] * s[..., 0] + s[..., 1] * s[..., 1], min=1e-12))
-        s_lin = torch.clamp((U_t - self.U1) / (self.U2 - self.U1), 0.0, 1.0)
-        # 相位比例：在大曲率时强反相；在小曲率且高速时允许微弱同相
+        U_t_cur = s[..., 5] if self.model_type == '2dof' else U_mag_t
+        s_lin = torch.clamp((U_t_cur - self.U1) / (self.U2 - self.U1 + 1e-12), 0.0, 1.0)
         k_t = (-self.k_max * G_turn) + (self.k_high * (1.0 - G_turn) * s_lin)
-        # 弯道提升相位权重
         w_phase = self.w_phase_base * (1.0 + 2.0 * G_turn)
         phase_err = dr_t - k_t * df_t
         cost = cost + w_phase * (phase_err ** 2)
 
-        # 直接惩罚同相（df*dr>0），随转弯增强
         same_sign_pos = torch.clamp(df_t * dr_t, min=0.0)
         cost = cost + (self.w_phase_sign * G_turn) * (same_sign_pos ** 2)
 
-        # 理想横摆率前馈参考，鼓励 dr 接近 dr_ff
-        if self.model_type == '2dof':
-            beta_np = s[..., 3].detach().cpu().numpy()
-            r_np = s[..., 4].detach().cpu().numpy()
-            df_np = s[..., 6].detach().cpu().numpy()
+        p = self.params
+        U_eff = max(abs(p.U), p.U_min)
+        U_eff_t = torch.tensor(U_eff, dtype=dtype, device=device)
+        Lc = p.a + p.b
+        Kc = (p.m / Lc) * (p.b / p.kr - p.a / p.kf)
+        r_ref_coeff = U_eff / (Lc + Kc * U_eff * U_eff)
+        r_ref = r_ref_coeff * df_t
+        if U_eff > 0.3:
+            r_max = p.mu * p.g / U_eff
+            r_max_t = torch.tensor(r_max, dtype=dtype, device=device)
+            r_cmd = torch.clamp(r_ref, -r_max_t, r_max_t)
         else:
-            vx_np = s[..., 0].detach().cpu().numpy()
-            vy_np = s[..., 1].detach().cpu().numpy()
-            beta_np = np.arctan2(vy_np, np.clip(vx_np, 1e-6, None))
-            r_np = s[..., 2].detach().cpu().numpy()
-            df_np = s[..., 7].detach().cpu().numpy()
-        dr_ff_list = []
-        for i in range(df_np.shape[0]):
-            try:
-                dr_ff, _ = ideal_yaw_rate(float(df_np[i]), np.array([beta_np[i], r_np[i]], dtype=float), self.params)
-            except Exception:
-                dr_ff = 0.0
-            dr_ff_list.append(float(dr_ff))
-        dr_ff_t = torch.tensor(dr_ff_list, dtype=s.dtype, device=s.device)
+            r_cmd = r_ref
+        T1 = (-(p.a * p.kf - p.b * p.kr) / U_eff - p.m * U_eff) * r_cmd
+        numerator = (
+            p.a * p.kf * df_t * (p.kf + p.kr)
+            - (p.a * p.kf - p.b * p.kr) * (p.kf * df_t + T1)
+            - (p.a ** 2 * p.kf + p.b ** 2 * p.kr) * r_cmd * (p.kf + p.kr) / U_eff_t
+        )
+        denom = p.kf * p.kr * (p.a + p.b)
+        delta_r_ff = numerator / denom
+        beta_ref = (p.kf * df_t + p.kr * delta_r_ff + T1) / (p.kf + p.kr)
+        Kr = 0.2
+        Kbeta = 0.0
+        r_cur = s[..., 4] if self.model_type == '2dof' else s[..., 2]
+        beta_cur = s[..., 3] if self.model_type == '2dof' else torch.atan2(s[..., 1], torch.clamp(s[..., 0], min=1e-6))
+        delta_r = delta_r_ff + Kr * (r_cmd - r_cur) + Kbeta * (beta_ref - beta_cur)
+        delta_r = torch.clamp(delta_r, -self.delta_max, self.delta_max)
+        dr_ff_t = delta_r
         cost = cost + self.w_yaw_ff * ((dr_t - dr_ff_t) ** 2)
 
-        # 弯道加速变化惩罚：抑制弯中激进加速或减速
         dU_t = u[..., 2]
         cost = cost + self.w_dU_turn * (dU_t ** 2) * G_turn
 
-        # 动作变化惩罚（使用上一时刻）
         if self._last_u is not None:
             du = u - self._last_u
             cost = cost + self.w_du * torch.sum(du * du, dim=-1)
