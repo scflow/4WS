@@ -2,14 +2,14 @@
 
 // 车辆参数（后端字段，仅用于显示与表单绑定）；控制与仿真均在后端
 let params = {
-  m: 1500, Iz: 2500, a: 1.2, b: 1.6,
-  width: 1.8, track: 1.5,
-  kf: 1.6e5, kr: 1.7e5,
-  U: 20, mu: 0.85, g: 9.81, U_min: 0.001, U_blend: 0.3,
-  tire_model: 'pacejka',
+  m: 35000.0, Iz: 500000.0, a: 8.0, b: 8.0,
+  width: 3.4, track: 3.4,
+  kf: 450000.0, kr: 450000.0,
+  U: 2.2, mu: 0.85, g: 9.81, U_min: 0.3, U_blend: 0.3,
+  tire_model: 'linear',
 };
 let state = { x: 0, y: 0, psi: 0, beta: 0, r: 0 };
-let ctrl = { U: 20, df: 0, dr: 0, running: false };
+let ctrl = { U: 2.2, df: 0, dr: 0, running: false };
 
 // 轨迹缓冲与设置
 let track = [];
@@ -487,41 +487,22 @@ function bindUI() {
     importPlanFile.addEventListener('change', async () => {
       const file = importPlanFile.files && importPlanFile.files[0];
       if (!file) return;
+      if (file.size > 10 * 1024 * 1024) { alert('文件超过 10MB 上限'); importPlanFile.value = ''; return; }
       try {
-        const text = await file.text();
-        const lines = text.split(/\r?\n/).map(s => s.trim()).filter(s => s.length > 0);
-        if (lines.length < 2) { alert('CSV 内容为空或不足'); return; }
-        const header = lines[0].split(',').map(s => s.trim());
-        const expect = ['t','x','y','psi'];
-        if (header.length !== expect.length || !header.every((h, i) => h === expect[i])) {
-          alert('CSV 表头必须为: t,x,y,psi'); return;
+        const fd = new FormData(); fd.append('file', file);
+        let res = await fetch('/api/plan/import_csv', { method: 'POST', body: fd });
+        if (!res.ok && res.status === 405) {
+          res = await fetch('/api/plan/import', { method: 'POST', body: fd });
         }
-        const points = [];
-        for (let i = 1; i < lines.length; i++) {
-          const cols = lines[i].split(',');
-          if (cols.length < 4) continue;
-          const t = cols[0].trim();
-          const x = cols[1].trim();
-          const y = cols[2].trim();
-          const psi = cols[3].trim();
-          const xv = Number(x); const yv = Number(y);
-          if (!Number.isFinite(xv) || !Number.isFinite(yv)) { alert(`第 ${i+1} 行 x/y 非数值`); return; }
-          const obj = { x: xv, y: yv };
-          if (t !== '') { const tv = Number(t); if (!Number.isFinite(tv)) { alert(`第 ${i+1} 行 t 非数值`); return; } obj.t = tv; }
-          if (psi !== '') { const pv = Number(psi); if (!Number.isFinite(pv)) { alert(`第 ${i+1} 行 psi 非数值`); return; } obj.psi = pv; }
-          points.push(obj);
-        }
-        if (points.length < 2) { alert('点数不足，至少需要 2 行数据'); return; }
-        const res = await fetch('/api/plan/import', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ points }) });
         if (!res.ok) { const err = await res.json().catch(() => ({ error: '导入失败' })); alert(err.error || '导入失败'); return; }
         await Promise.all([
-          fetch('/api/plan', { cache: 'no-store' }).then(r => r.ok ? r.json() : { points: [] }).then(d => { plan = Array.isArray(d.points) ? d.points : []; }),
+          fetch('/api/plan?max=2000', { cache: 'no-store' }).then(r => r.ok ? r.json() : { points: [] }).then(d => { plan = Array.isArray(d.points) ? d.points : []; }),
         ]);
         view.follow = true; centerOnVehicle(); draw();
         alert('导入成功');
       } catch (e) {
-        console.warn('导入规划 CSV 失败', e);
-        alert('导入失败，请检查文件格式');
+        console.warn('上传并导入规划 CSV 失败', e);
+        alert('导入失败，请稍后重试');
       } finally {
         importPlanFile.value = '';
       }
@@ -714,12 +695,30 @@ function bindUI() {
         fetch('/api/state', { cache: 'no-store' }),
         fetch('/api/track', { cache: 'no-store' }),
         fetch('/api/control', { cache: 'no-store' }),
-        fetch('/api/plan', { cache: 'no-store' }),
+        fetch('/api/plan?max=2000', { cache: 'no-store' }),
       ]);
       if (stRes.ok) { state = await stRes.json(); }
       if (trRes.ok) { const td = await trRes.json(); track = Array.isArray(td.points) ? td.points : []; }
       if (ctRes.ok) { ctrl = await ctRes.json(); }
-      if (plRes.ok) { const pd = await plRes.json(); plan = Array.isArray(pd.points) ? pd.points : []; }
+      if (plRes.ok) {
+        const pd = await plRes.json();
+        plan = Array.isArray(pd.points) ? pd.points : [];
+        // 若需要完整轨迹且当前只抽样，尝试分片一次性加载完整
+        try {
+          const metaRes = await fetch('/api/plan/meta', { cache: 'no-store' });
+          if (metaRes.ok) {
+            const meta = await metaRes.json(); const total = Number(meta.count || 0);
+            if (total > plan.length && total > 0) {
+              const chunkSize = 4000; let full = [];
+              for (let s = 0; s < total; s += chunkSize) {
+                const chRes = await fetch(`/api/plan/chunk?start=${s}&count=${chunkSize}`, { cache: 'no-store' });
+                if (chRes.ok) { const ch = await chRes.json(); if (Array.isArray(ch.points)) full = full.concat(ch.points); }
+              }
+              if (full.length === total) plan = full;
+            }
+          }
+        } catch {}
+      }
       // 同步按钮文字与输入框显示（避免覆盖正在编辑的元素）
       startPauseBtn.textContent = ctrl.running ? '暂停' : '开始';
       const safeSet = (el, v) => { if (!el || document.activeElement === el) return; el.value = String(v); };

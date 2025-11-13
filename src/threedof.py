@@ -20,15 +20,15 @@ class Vehicle3DOF:
 
     Coordinates and parameters follow documents/3dof.md.
     """
-    m: float = 1500.0            # mass [kg]
-    Iz: float = 2500.0           # yaw inertia [kg*m^2]
-    a: float = 1.2               # CG to front axle [m]
-    b: float = 1.6               # CG to rear axle [m]
+    m: float = 35000.0            # mass [kg]
+    Iz: float = 500000.0           # yaw inertia [kg*m^2]
+    a: float = 8.0               # CG to front axle [m]
+    b: float = 8.0               # CG to rear axle [m]
     g: float = 9.81              # gravity [m/s^2]
     U_min: float = 0.5           # min longitudinal speed to avoid singularities [m/s]
     # Linear cornering stiffness for optional linear tire model
-    kf: float = 1.6e5
-    kr: float = 1.7e5
+    kf: float = 450000.0
+    kr: float = 450000.0
     # Tire model selection: 'pacejka' or 'linear'
     tire_model: str = 'pacejka'
 

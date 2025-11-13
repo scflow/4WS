@@ -20,22 +20,22 @@ class VehicleParams:
     - U_min: 速度下限，避免 r/U 奇异
     """
 
-    m: float = 1500.0
-    Iz: float = 2500.0
-    a: float = 1.2
-    b: float = 1.6
-    width: float = 1.8
-    track: float = 1.5
-    kf: float = 1.6e5
-    kr: float = 1.7e5
-    U: float = 20.0
+    m: float = 35000.0
+    Iz: float = 500000.0
+    a: float = 8.0
+    b: float = 8.0
+    width: float = 3.4
+    track: float = 3.4
+    kf: float = 450000.0
+    kr: float = 450000.0
+    U: float = 2.2
     mu: float = 0.85
     g: float = 9.81
     U_min: float = 0.3
     # 低速融合阈值：当 |U| < U_blend 时，逐渐转为几何模型以稳定数值
     U_blend: float = 0.3
     # 轮胎模型选择：'pacejka'（魔术方程）或 'linear'（线性侧偏刚度）
-    tire_model: str = 'pacejka'
+    tire_model: str = 'linear'
 
     @property
     def L(self) -> float:

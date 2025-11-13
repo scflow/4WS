@@ -8,6 +8,7 @@ import numpy as np
 import os
 
 app = Flask(__name__, static_folder='web', static_url_path='')
+app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024
 
 # 启动时加载配置文件并应用
 def _resolve_cfg_path() -> str:
@@ -309,7 +310,41 @@ def api_track_settings():
 def api_plan_get():
     try:
         pts = getattr(ENGINE, 'plan', []) or []
+        try:
+            maxn = int(request.args.get('max', '0'))
+        except Exception:
+            maxn = 0
+        if maxn and maxn > 0 and len(pts) > maxn:
+            n = len(pts)
+            out = []
+            for i in range(maxn):
+                idx = int(round(i * (n - 1) / max(1, maxn - 1)))
+                out.append(pts[idx])
+            pts = out
         return jsonify({'points': pts})
+    except Exception as e:
+        return jsonify({'error': str(e), 'points': []}), 200
+
+@app.route('/api/plan/meta', methods=['GET'])
+def api_plan_meta():
+    try:
+        pts = getattr(ENGINE, 'plan', []) or []
+        return jsonify({'count': len(pts)})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 200
+
+@app.route('/api/plan/chunk', methods=['GET'])
+def api_plan_chunk():
+    try:
+        pts = getattr(ENGINE, 'plan', []) or []
+        try:
+            start = int(request.args.get('start', '0'))
+            count = int(request.args.get('count', '1000'))
+        except Exception:
+            start = 0; count = 1000
+        start = max(0, start)
+        end = min(len(pts), start + max(0, count))
+        return jsonify({'points': pts[start:end], 'start': start, 'end': end, 'total': len(pts)})
     except Exception as e:
         return jsonify({'error': str(e), 'points': []}), 200
 
@@ -415,8 +450,70 @@ def api_plan_circle():
     ENGINE.load_plan(plan)
     return jsonify({'ok': True, 'N': N, 'count': len(plan)})
 
-@app.route('/api/plan/import', methods=['POST'])
+@app.route('/api/plan/import', methods=['POST', 'OPTIONS'])
 def api_plan_import():
+    if request.method == 'OPTIONS':
+        return ('', 204)
+    # 兼容 multipart 上传：若存在文件则走 CSV 路径
+    try:
+        if 'file' in request.files:
+            f = request.files['file']
+            if not f:
+                return jsonify({'error': 'empty upload'}), 400
+            from io import TextIOWrapper
+            import csv as _csv
+            wrapper = TextIOWrapper(f.stream, encoding='utf-8', errors='replace')
+            reader = _csv.reader(wrapper)
+            header = next(reader, None)
+            if not header or [h.strip() for h in header] != ['t','x','y','psi']:
+                return jsonify({'error': 'header must be t,x,y,psi'}), 400
+            pts = []
+            for row in reader:
+                if not row or len(row) < 4:
+                    continue
+                try:
+                    t = float(row[0]) if row[0] != '' else 0.0
+                    x = float(row[1]); y = float(row[2])
+                    psi = float(row[3]) if row[3] != '' else 0.0
+                except Exception:
+                    return jsonify({'error': 'invalid numeric row'}), 400
+                pts.append({'t': t, 'x': x, 'y': y, 'psi': psi})
+            if len(pts) < 2:
+                return jsonify({'error': 'too few points'}), 400
+            # 简易清洗与重算 psi
+            out = []
+            last = None
+            for p in pts:
+                if last is None:
+                    out.append(p); last = p; continue
+                dx = p['x'] - last['x']; dy = p['y'] - last['y']
+                ds = float(np.hypot(dx, dy))
+                if ds <= 1e-6:
+                    continue
+                out.append(p); last = p
+            for i in range(len(out)):
+                if i < len(out) - 1:
+                    dx = out[i+1]['x'] - out[i]['x']; dy = out[i+1]['y'] - out[i]['y']
+                else:
+                    dx = out[i]['x'] - out[i-1]['x']; dy = out[i]['y'] - out[i-1]['y']
+                out[i]['psi'] = float(np.arctan2(dy, dx)) if (abs(dx) + abs(dy)) > 1e-9 else out[i].get('psi', 0.0)
+            W = 5; half = W // 2
+            psi_sm = []
+            for i in range(len(out)):
+                a = max(0, i - half); b = min(len(out) - 1, i + half)
+                ss = 0.0; cc = 0.0
+                for k in range(a, b + 1):
+                    ss += float(np.sin(out[k]['psi']))
+                    cc += float(np.cos(out[k]['psi']))
+                psi_sm.append(float(np.arctan2(ss, cc)))
+            for i in range(len(out)):
+                out[i]['psi'] = psi_sm[i]
+                out[i]['t'] = float(i) * 0.05
+            ENGINE.load_plan(out)
+            return jsonify({'ok': True, 'count': len(out)})
+    except Exception:
+        pass
+    # JSON points 路径
     data = request.get_json(force=True) or {}
     pts = data.get('points')
     if not isinstance(pts, list):
@@ -424,8 +521,23 @@ def api_plan_import():
     n = len(pts)
     if n < 2:
         return jsonify({'error': 'points length must be >= 2'}), 400
-    if n > 5000:
-        return jsonify({'error': 'points length too large'}), 400
+    opts = data.get('options') if isinstance(data.get('options'), dict) else {}
+    try:
+        dup_eps = float(opts.get('dup_eps', 1e-3))
+    except Exception:
+        dup_eps = 1e-3
+    try:
+        max_step = float(opts.get('max_step', 1.0))
+    except Exception:
+        max_step = 1.0
+    try:
+        smooth_window = int(opts.get('smooth_window', 5))
+    except Exception:
+        smooth_window = 5
+    try:
+        dt_val = float(opts.get('dt', 0.1))
+    except Exception:
+        dt_val = 0.1
 
     def _wrap(a: float) -> float:
         return float((a + np.pi) % (2.0 * np.pi) - np.pi)
@@ -457,22 +569,75 @@ def api_plan_import():
     for i in range(n):
         if not np.isfinite(out[i]['psi']):
             out[i]['psi'] = 0.0
-    for i in range(n):
-        if 'psi' in out[i] and out[i]['psi'] != 0.0:
+    cleaned = []
+    removed_dup = 0
+    for i in range(len(out)):
+        if i == 0:
+            cleaned.append(out[i])
             continue
-        j = i + 1 if i + 1 < n else (i - 1 if i - 1 >= 0 else i)
-        dx = out[j]['x'] - out[i]['x']
-        dy = out[j]['y'] - out[i]['y']
-        if abs(dx) < 1e-9 and abs(dy) < 1e-9:
-            if i > 0:
-                out[i]['psi'] = out[i - 1]['psi']
-            else:
-                out[i]['psi'] = 0.0
+        dx = out[i]['x'] - cleaned[-1]['x']
+        dy = out[i]['y'] - cleaned[-1]['y']
+        ds = float(np.hypot(dx, dy))
+        if ds <= dup_eps:
+            removed_dup += 1
+            continue
+        cleaned.append(out[i])
+    if len(cleaned) < 2:
+        return jsonify({'error': 'trajectory too short after duplicate removal'}), 400
+    inserted = 0
+    densified = []
+    for i in range(len(cleaned) - 1):
+        p0 = cleaned[i]
+        p1 = cleaned[i + 1]
+        densified.append(p0)
+        dx = p1['x'] - p0['x']
+        dy = p1['y'] - p0['y']
+        ds = float(np.hypot(dx, dy))
+        if ds > max_step:
+            k = int(np.ceil(ds / max_step))
+            if k > 1:
+                for j in range(1, k):
+                    r = j / k
+                    xi = p0['x'] + r * dx
+                    yi = p0['y'] + r * dy
+                    densified.append({'t': 0.0, 'x': xi, 'y': yi, 'psi': 0.0})
+                    inserted += 1
+    densified.append(cleaned[-1])
+    m = len(densified)
+    if m < 2:
+        return jsonify({'error': 'trajectory too short after densify'}), 400
+    for i in range(m):
+        if i < m - 1:
+            dx = densified[i + 1]['x'] - densified[i]['x']
+            dy = densified[i + 1]['y'] - densified[i]['y']
         else:
-            out[i]['psi'] = _wrap(float(np.arctan2(dy, dx)))
+            dx = densified[i]['x'] - densified[i - 1]['x']
+            dy = densified[i]['y'] - densified[i - 1]['y']
+        if abs(dx) < 1e-9 and abs(dy) < 1e-9:
+            densified[i]['psi'] = densified[i - 1]['psi'] if i > 0 else 0.0
+        else:
+            densified[i]['psi'] = _wrap(float(np.arctan2(dy, dx)))
+    if smooth_window < 3:
+        smooth_window = 3
+    if smooth_window % 2 == 0:
+        smooth_window += 1
+    half = smooth_window // 2
+    psi_sm = []
+    for i in range(m):
+        a = max(0, i - half)
+        b = min(m - 1, i + half)
+        ss = 0.0
+        cc = 0.0
+        for k in range(a, b + 1):
+            ss += float(np.sin(densified[k]['psi']))
+            cc += float(np.cos(densified[k]['psi']))
+        psi_sm.append(_wrap(float(np.arctan2(ss, cc))))
+    for i in range(m):
+        densified[i]['psi'] = psi_sm[i]
+        densified[i]['t'] = float(i) * dt_val
 
-    ENGINE.load_plan(out)
-    return jsonify({'ok': True, 'count': len(out)})
+    ENGINE.load_plan(densified)
+    return jsonify({'ok': True, 'count': len(densified), 'inserted_points': inserted, 'removed_duplicates': removed_dup})
 
 # 自动跟踪开关/查询（根据参考轨迹沿路输出前后轮角）
 @app.route('/api/autop', methods=['GET', 'POST'])
@@ -584,3 +749,72 @@ if __name__ == '__main__':
             ENGINE.shutdown()
         except Exception:
             pass
+from io import TextIOWrapper
+import csv as _csv
+
+@app.route('/api/plan/import_csv', methods=['POST', 'OPTIONS'])
+def api_plan_import_csv():
+    try:
+        if request.method == 'OPTIONS':
+            return ('', 204)
+        if 'file' not in request.files:
+            return jsonify({'error': 'missing file field'}), 400
+        f = request.files['file']
+        if not f:
+            return jsonify({'error': 'empty upload'}), 400
+        # 流式读取 CSV
+        wrapper = TextIOWrapper(f.stream, encoding='utf-8', errors='replace')
+        reader = _csv.reader(wrapper)
+        header = next(reader, None)
+        if not header or [h.strip() for h in header] != ['t','x','y','psi']:
+            return jsonify({'error': 'header must be t,x,y,psi'}), 400
+        pts = []
+        for row in reader:
+            if not row or len(row) < 4:
+                continue
+            try:
+                t = float(row[0]) if row[0] != '' else 0.0
+                x = float(row[1])
+                y = float(row[2])
+                psi = float(row[3]) if row[3] != '' else 0.0
+            except Exception:
+                return jsonify({'error': 'invalid numeric row'}), 400
+            pts.append({'t': t, 'x': x, 'y': y, 'psi': psi})
+        if len(pts) < 2:
+            return jsonify({'error': 'too few points'}), 400
+        # 基础清洗与平滑：复用导入逻辑（简化版）
+        out = []
+        last = None
+        for p in pts:
+            if last is None:
+                out.append(p); last = p; continue
+            dx = p['x'] - last['x']; dy = p['y'] - last['y']
+            ds = float(np.hypot(dx, dy))
+            if ds <= 1e-6:
+                continue
+            out.append(p); last = p
+        # 重算 psi（几何）
+        for i in range(len(out)):
+            if i < len(out) - 1:
+                dx = out[i+1]['x'] - out[i]['x']; dy = out[i+1]['y'] - out[i]['y']
+            else:
+                dx = out[i]['x'] - out[i-1]['x']; dy = out[i]['y'] - out[i-1]['y']
+            out[i]['psi'] = float(np.arctan2(dy, dx)) if (abs(dx) + abs(dy)) > 1e-9 else out[i].get('psi', 0.0)
+        # 圆均值平滑 psi
+        W = 5
+        half = W // 2
+        psi_sm = []
+        for i in range(len(out)):
+            a = max(0, i - half); b = min(len(out) - 1, i + half)
+            ss = 0.0; cc = 0.0
+            for k in range(a, b + 1):
+                ss += float(np.sin(out[k]['psi']))
+                cc += float(np.cos(out[k]['psi']))
+            psi_sm.append(float(np.arctan2(ss, cc)))
+        for i in range(len(out)):
+            out[i]['psi'] = psi_sm[i]
+            out[i]['t'] = float(i) * 0.05
+        ENGINE.load_plan(out)
+        return jsonify({'ok': True, 'count': len(out)})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 400
