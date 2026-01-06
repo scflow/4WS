@@ -11,7 +11,12 @@ def wrap_pi(a: float) -> float:
     return (a + math.pi) % (2.0 * math.pi) - math.pi
 
 def convert_group(rows, heading_ref: str = 'east', dt: float = 0.1):
-    rows = sorted(rows, key=lambda r: int(r['order']))
+    has_order = all(('order' in r and str(r['order']).strip() != '') for r in rows)
+    if has_order:
+        try:
+            rows = sorted(rows, key=lambda r: int(r['order']))
+        except Exception:
+            pass
     lon0 = float(rows[0]['lon'])
     lat0 = float(rows[0]['lat'])
     lat0_rad = math.radians(lat0)
@@ -196,78 +201,55 @@ def resample_by_arclength(points, ds_straight=0.02, ds_curve=0.01, kappa_thresho
     return out_pts
 
 def main():
-    ap = argparse.ArgumentParser(description='Convert ID,order,lon,lat,heading CSV to plan t,x,y,psi CSVs')
+    ap = argparse.ArgumentParser(description='Convert lon,lat,heading CSV to plan t,x,y,psi CSV')
     ap.add_argument('--input', default='/home/oem/src/4WS/documents/pts_yangluo_follow.csv')
     ap.add_argument('--input-dir', default=None, help='directory containing CSV files to batch convert')
     ap.add_argument('--glob', default='*.csv', help='glob pattern for batch input')
     ap.add_argument('--outdir', default=None)
-    ap.add_argument('--id', default=None, help='Only export this ID')
     ap.add_argument('--heading-ref', choices=['east','north'], default='east', help='heading reference: east or north')
     ap.add_argument('--dt', type=float, default=0.1, help='time step seconds')
-    ap.add_argument('--merge-all', action='store_true', help='merge all IDs into single trajectory and normalize start to (0,0,psi=0)')
     ap.add_argument('--dup-eps', type=float, default=1e-3, help='duplicate removal threshold (m)')
     ap.add_argument('--max-step', type=float, default=1.0, help='max segment length before densify (m)')
     ap.add_argument('--smooth-window', type=int, default=5, help='psi smoothing window size (odd)')
+    ap.add_argument('--no-densify', action='store_true', help='disable densify/resample steps')
+    ap.add_argument('--normalize', action='store_true', help='normalize start to (0,0,psi=0)')
     args = ap.parse_args()
 
     def process_file(path: str):
         outdir_local = args.outdir or os.path.dirname(path) or '.'
-        groups = {}
+        rows = []
         with open(path, 'r', newline='', encoding='utf-8') as f:
             rd = csv.DictReader(f)
             for row in rd:
-                gid = str(row['ID'])
-                groups.setdefault(gid, []).append(row)
-        ids = [args.id] if args.id is not None else list(groups.keys())
+                try:
+                    lon = float(row.get('lon'))
+                    lat = float(row.get('lat'))
+                    hdg = float(row.get('heading'))
+                except Exception:
+                    continue
+                rec = {'lon': lon, 'lat': lat, 'heading': hdg}
+                if 'order' in row:
+                    rec['order'] = row.get('order')
+                rows.append(rec)
+        if not rows:
+            print(f'No valid rows in {path}')
+            return
         os.makedirs(outdir_local, exist_ok=True)
         stem = os.path.splitext(os.path.basename(path))[0]
-        if args.merge_all:
-            all_rows = []
-            for gid in ids:
-                if gid in groups:
-                    all_rows.extend(sorted(groups[gid], key=lambda r: int(r['order'])))
-            if all_rows:
-                lon0 = float(all_rows[0]['lon'])
-                lat0 = float(all_rows[0]['lat'])
-                lat0_rad = math.radians(lat0)
-                kx = (math.pi / 180.0) * R * math.cos(lat0_rad)
-                ky = (math.pi / 180.0) * R
-                pts = []
-                for i, r in enumerate(all_rows):
-                    lon = float(r['lon']); lat = float(r['lat']); hdg = float(r['heading'])
-                    x = (lon - lon0) * kx
-                    y = (lat - lat0) * ky
-                    psi = hdg if args.heading_ref == 'east' else (math.pi / 2.0 - hdg)
-                    psi = wrap_pi(psi)
-                    t = i * args.dt
-                    pts.append({'t': t, 'x': x, 'y': y, 'psi': psi})
-                pts = rotate_normalize(pts)
-                pts = clean_and_smooth(pts, dup_eps=args.dup_eps, max_step=args.max_step, smooth_window=args.smooth_window, dt=args.dt,
-                                        curve_step=0.05, kappa_threshold=0.02)
-                pts = resample_by_arclength(pts, ds_straight=0.02, ds_curve=0.01, kappa_threshold=0.02)
-                out_path = os.path.join(outdir_local, f'plan_{stem}_merged.csv')
-                with open(out_path, 'w', newline='', encoding='utf-8') as f:
-                    wr = csv.writer(f)
-                    wr.writerow(['t','x','y','psi'])
-                    for p in pts:
-                        wr.writerow([f"{p['t']:.3f}", f"{p['x']:.6f}", f"{p['y']:.6f}", f"{p['psi']:.9f}"])
-                print(f'Wrote {out_path} ({len(pts)} points)')
-        else:
-            for gid in ids:
-                if gid not in groups:
-                    continue
-                pts = convert_group(groups[gid], heading_ref=args.heading_ref, dt=args.dt)
-                pts = rotate_normalize(pts)
-                pts = clean_and_smooth(pts, dup_eps=args.dup_eps, max_step=args.max_step, smooth_window=args.smooth_window, dt=args.dt,
-                                        curve_step=0.05, kappa_threshold=0.02)
-                pts = resample_by_arclength(pts, ds_straight=0.02, ds_curve=0.01, kappa_threshold=0.02)
-                out_path = os.path.join(outdir_local, f'plan_{stem}_{gid}.csv')
-                with open(out_path, 'w', newline='', encoding='utf-8') as f:
-                    wr = csv.writer(f)
-                    wr.writerow(['t','x','y','psi'])
-                    for p in pts:
-                        wr.writerow([f"{p['t']:.3f}", f"{p['x']:.6f}", f"{p['y']:.6f}", f"{p['psi']:.9f}"])
-                print(f'Wrote {out_path} ({len(pts)} points)')
+        pts = convert_group(rows, heading_ref=args.heading_ref, dt=args.dt)
+        if args.normalize:
+            pts = rotate_normalize(pts)
+        if not args.no_densify:
+            pts = clean_and_smooth(pts, dup_eps=args.dup_eps, max_step=args.max_step, smooth_window=args.smooth_window, dt=args.dt,
+                                    curve_step=0.05, kappa_threshold=0.02)
+            pts = resample_by_arclength(pts, ds_straight=0.02, ds_curve=0.01, kappa_threshold=0.02)
+        out_path = os.path.join(outdir_local, f'plan11_{stem}.csv')
+        with open(out_path, 'w', newline='', encoding='utf-8') as f:
+            wr = csv.writer(f)
+            wr.writerow(['t','x','y','psi'])
+            for p in pts:
+                wr.writerow([f"{p['t']:.3f}", f"{p['x']:.6f}", f"{p['y']:.6f}", f"{p['psi']:.9f}"])
+        print(f'Wrote {out_path} ({len(pts)} points)')
 
     if args.input_dir:
         pattern = os.path.join(args.input_dir, args.glob)

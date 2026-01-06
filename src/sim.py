@@ -79,6 +79,8 @@ class SimEngine:
         self.autop_enabled: bool = False
         self.autop_mode: Literal['simple', 'mpc', 'mppi'] = 'mpc'
         self._plan_idx: int = 0
+        self.ctrl_plan_max_points = 4000
+        self.ctrl_plan_pad_factor = 1.5
         # 控制器类型指示与几何回退标记
         self.controller_type: Literal['simple', 'mpc', 'mppi', 'geometric', 'manual'] = 'manual'
         self._geom_fallback_active: bool = False
@@ -539,6 +541,41 @@ class SimEngine:
             'ds_ref': ds_ref,
         }
 
+    def _get_plan_for_controller(self, H_est: int) -> List[Dict[str, float]]:
+        with self._lock:
+            pts = self.plan
+            n = len(pts)
+            if n <= 2:
+                return list(pts)
+            x = float(self.state2.x)
+            y = float(self.state2.y)
+            psi_cur = float(self.state2.psi)
+            U_mag = float(self.params.U_eff())
+            ref = self._plan_ref_geometry(x, y, psi_cur, U_mag)
+            base_i = int(ref.get('base_i', 0))
+            base_i = max(0, min(n - 2, base_i))
+            H_eff = max(1, int(H_est))
+            Lwin = float(U_mag * self.dt * H_eff * float(self.ctrl_plan_pad_factor))
+            s_acc = 0.0
+            end_i = base_i
+            while end_i < n - 1 and s_acc < Lwin:
+                p = pts[end_i]
+                q = pts[end_i + 1]
+                s_acc += float(np.hypot(q['x'] - p['x'], q['y'] - p['y']))
+                if s_acc < Lwin:
+                    end_i += 1
+            end_i = min(end_i + 1, n - 1)
+            segment = pts[base_i:end_i + 1]
+            m = len(segment)
+            maxp = int(self.ctrl_plan_max_points)
+            if m <= maxp or maxp <= 2:
+                return list(segment)
+            out = []
+            for i in range(maxp):
+                idx = int(round(i * (m - 1) / max(1, maxp - 1)))
+                out.append(segment[idx])
+            return out
+
     def _autop_update_simple(self):
         """纯追踪（Pure Pursuit）：选择预瞄点，用几何公式输出前轮角，后轮用理想横摆补偿。"""
         if not (self.autop_enabled and self.mode == '2dof' and len(self.plan) > 0):
@@ -640,7 +677,7 @@ class SimEngine:
                 self._mppi_ctrl = MPPIController4WS(
                     params=self.params,
                     dt=self.dt,
-                    plan_provider=lambda: self.plan,
+                    plan_provider=lambda: self._get_plan_for_controller(30),
                     delta_max=float(self.delta_max),
                     dU_max=float(self.dU_max),
                     U_max=float(self.U_max),
@@ -653,7 +690,7 @@ class SimEngine:
                     self._mppi_ctrl = MPPIController4WS(
                         params=self.params,
                         dt=self.dt,
-                        plan_provider=lambda: self.plan,
+                        plan_provider=lambda: self._get_plan_for_controller(30),
                         delta_max=float(self.delta_max),
                         dU_max=float(self.dU_max),
                         U_max=float(self.U_max),
@@ -721,7 +758,7 @@ class SimEngine:
                     self._mppi_ctrl = MPPIController4WS(
                         params=self.params,
                         dt=self.dt,
-                        plan_provider=lambda: self.plan,
+                        plan_provider=lambda: self._get_plan_for_controller(30),
                         delta_max=float(self.delta_max),
                         dU_max=float(self.dU_max),
                         U_max=float(self.U_max),
@@ -849,13 +886,15 @@ class SimEngine:
         # 注意：这里的权重和以前完全不同！
         # Q_ey 和 Q_epsi 应该是主要驱动力
         # R 和 R_delta 应该相对较小，以允许控制器动作
+        H_pred = 20
+        plan_ctrl = self._get_plan_for_controller(H_pred)
         df_cmd, dr_cmd = solve_mpc_kin_dyn_4dof(
             state_for_mpc,
             ctrl_raw,
             self.params,
-            self.plan,
+            plan_ctrl,
             self.dt,
-            H=20,           # 预测时域
+            H=H_pred,           # 预测时域
             Q_ey=100,      # !! 高横向误差惩罚
             Q_epsi=10000,     # !! 高航向误差惩罚
             Q_beta=20,     # 低侧滑惩罚

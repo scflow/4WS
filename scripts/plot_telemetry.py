@@ -195,7 +195,7 @@ def plot_from_csv(path: str):
 
 
 def main():
-    default_csv = '/Users/gjc/src/4ws/data/telemetry_2025-11-06T02-06-34-016Z.csv'
+    default_csv = 'data/telemetry_2025-11-14T01-42-18-981Z.csv'
     csv_path = sys.argv[1] if len(sys.argv) >= 2 else default_csv
     if not os.path.exists(csv_path):
         print('文件不存在：', csv_path)

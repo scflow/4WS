@@ -1,16 +1,16 @@
 vehicle:
   m: 35000.0
   Iz: 500000.0
-  a: 8.0
-  b: 8.0
+  a: 5.0
+  b: 5.0
   width: 3.4
   track: 3.4
   kf: 450000.0
   kr: 450000.0
-  U: 1.5
+  U: 2.2
   mu: 0.85
   g: 9.81
-  U_min: 0.001
+  U_min: 0.3
   U_blend: 0.3
   tire_model: linear
 control:
